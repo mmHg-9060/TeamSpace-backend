@@ -1,11 +1,11 @@
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from app.api.dependencies import get_current_user
-from app.api.shared import envelope, iso, user_can_finance, user_profile
+from app.api.shared import envelope, iso, user_can_finance
 from app.db.session import get_db
 from app.models.resource import Resource
 from app.models.user import User
@@ -27,23 +27,6 @@ SEARCH_TYPES = {
 }
 
 
-def _match(value: object, needle: str) -> bool:
-    return needle.casefold() in str(value or "").casefold()
-
-
-def _within_period(created_at: datetime | None, period: str) -> bool:
-    if period == "all":
-        return True
-    days = {"7d": 7, "30d": 30, "90d": 90}.get(period)
-    if days is None:
-        raise HTTPException(400, "period는 all, 7d, 30d, 90d 중 하나여야 합니다.")
-    if created_at is None:
-        return False
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    return created_at >= datetime.now(timezone.utc) - timedelta(days=days)
-
-
 @router.get("/search", summary="권한에 따른 통합 검색")
 def search(
     query: str | None = Query(None, min_length=2),
@@ -63,28 +46,72 @@ def search(
     if kinds is None:
         raise HTTPException(400, "지원하지 않는 검색 유형입니다.")
 
+    try:
+        offset = int(cursor or 0)
+    except ValueError:
+        raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    if offset < 0 or offset > 10_000:
+        raise HTTPException(400, "cursor 값이 허용 범위를 벗어났습니다.")
+    take = offset + limit + 1
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(period)
+    if period != "all" and days is None:
+        raise HTTPException(400, "period는 all, 7d, 30d, 90d 중 하나여야 합니다.")
+    created_after = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+    pattern = f"%{needle}%"
     matches = []
+    counts_by_kind: dict[str, int] = {}
     for kind in kinds:
         if kind == "person":
-            for person in db.scalars(select(User).order_by(User.name)):
-                profile = user_profile(db, person)
-                if dept and profile.get("dept") != dept:
-                    continue
-                title = profile.get("name", "")
-                searchable = " ".join(
-                    str(profile.get(key, "")) for key in ("name", "dept", "role", "bio")
+            profile = aliased(Resource)
+            profile_dept = func.coalesce(
+                profile.payload["dept"].as_string(), User.department, ""
+            )
+            person_filters = []
+            if dept:
+                person_filters.append(profile_dept == dept)
+            if created_after:
+                person_filters.append(User.created_at >= created_after)
+            person_filters.append(
+                or_(
+                    User.name.ilike(pattern),
+                    User.email.ilike(pattern),
+                    profile_dept.ilike(pattern),
+                    profile.payload["major"].as_string().ilike(pattern),
+                    profile.payload["bio"].as_string().ilike(pattern),
                 )
-                if not _match(searchable, needle):
-                    continue
+            )
+            join_condition = and_(
+                profile.resource_type == "profile", profile.owner_id == User.id
+            )
+            count = (
+                db.scalar(
+                    select(func.count(func.distinct(User.id)))
+                    .select_from(User)
+                    .outerjoin(profile, join_condition)
+                    .where(*person_filters)
+                )
+                or 0
+            )
+            counts_by_kind[kind] = count
+            title_match = func.lower(User.name).contains(needle.casefold())
+            people = db.execute(
+                select(User, profile)
+                .outerjoin(profile, join_condition)
+                .where(*person_filters)
+                .order_by(title_match.desc(), User.created_at.desc(), User.id.desc())
+                .limit(take)
+            )
+            for person, profile_row in people:
+                profile_data = profile_row.payload if profile_row else {}
+                person_dept = profile_data.get("dept", person.department or "")
+                role = profile_data.get("major", "")
                 matches.append(
                     {
                         "category": "people",
                         "id": str(person.id),
-                        "title": title,
+                        "title": person.name,
                         "snippet": " · ".join(
-                            value
-                            for value in (profile.get("dept"), profile.get("role"))
-                            if value
+                            value for value in (person_dept, role) if value
                         ),
                         "createdAt": iso(person.created_at),
                         "href": f"/inhouse/people/{person.id}",
@@ -93,30 +120,85 @@ def search(
             continue
 
         resource_type = kind
+        title_expr = func.coalesce(
+            Resource.payload["title"].as_string(),
+            Resource.payload["name"].as_string(),
+            "",
+        )
+        content_expr = func.coalesce(
+            Resource.payload["copy"].as_string(),
+            Resource.payload["body"].as_string(),
+            Resource.payload["description"].as_string(),
+            Resource.payload["content"].as_string(),
+            "",
+        )
+        filters = [Resource.resource_type == resource_type]
+        if created_after:
+            filters.append(Resource.created_at >= created_after)
+        filters.append(or_(title_expr.ilike(pattern), content_expr.ilike(pattern)))
+        if kind == "post":
+            filters.extend(
+                [
+                    func.coalesce(Resource.payload["status"].as_string(), "published")
+                    == "published",
+                    or_(
+                        Resource.payload["anonymous"].as_boolean().is_(False),
+                        Resource.payload["anonymous"].as_boolean().is_(None),
+                    ),
+                    or_(
+                        Resource.payload["isAnonymous"].as_boolean().is_(False),
+                        Resource.payload["isAnonymous"].as_boolean().is_(None),
+                    ),
+                ]
+            )
+        if kind == "proposal":
+            filters.extend(
+                [
+                    or_(
+                        Resource.payload["anonymous"].as_boolean().is_(False),
+                        Resource.payload["anonymous"].as_boolean().is_(None),
+                    ),
+                    or_(
+                        Resource.payload["isAnonymous"].as_boolean().is_(False),
+                        Resource.payload["isAnonymous"].as_boolean().is_(None),
+                    ),
+                ]
+            )
+        if kind in {"doc", "rule"} and not user_can_finance(user):
+            filters.append(
+                and_(
+                    func.upper(func.coalesce(Resource.payload["type"].as_string(), ""))
+                    != "FINANCE",
+                    func.upper(
+                        func.coalesce(Resource.payload["category"].as_string(), "")
+                    )
+                    != "FINANCE",
+                )
+            )
+        dept_expr = func.coalesce(
+            Resource.payload["dept"].as_string(),
+            Resource.payload["department"].as_string(),
+            "",
+        )
+        if dept and kind == "project":
+            filters.append(dept_expr == dept)
+        count = (
+            db.scalar(select(func.count()).select_from(Resource).where(*filters)) or 0
+        )
+        counts_by_kind[kind] = count
+        title_match = func.lower(title_expr).contains(needle.casefold())
         records = db.scalars(
             select(Resource)
-            .where(Resource.resource_type == resource_type)
-            .order_by(Resource.created_at.desc())
-            .limit(1000)
+            .where(*filters)
+            .order_by(
+                title_match.desc(), Resource.created_at.desc(), Resource.id.desc()
+            )
+            .limit(take)
         )
         for record in records:
             data = record.payload or {}
-            if not _within_period(record.created_at, period):
-                continue
-            if kind == "post":
-                if data.get("status", "published") != "published":
-                    continue
-                # Anonymous content is kept out of global search to avoid identity inference.
-                if data.get("anonymous") or data.get("isAnonymous"):
-                    continue
-            if kind == "proposal" and data.get("anonymous"):
-                continue
             doc_type = str(data.get("type", data.get("category", ""))).upper()
-            if kind == "doc" and doc_type == "FINANCE" and not user_can_finance(user):
-                continue
             record_dept = str(data.get("dept", data.get("department", "")))
-            if dept and kind == "project" and record_dept != dept:
-                continue
             title = str(data.get("title", data.get("name", "")))
             content = str(
                 data.get(
@@ -124,8 +206,6 @@ def search(
                     data.get("body", data.get("description", data.get("content", ""))),
                 )
             )
-            if not _match(f"{title} {content}", needle):
-                continue
             category = {
                 "doc": "documents",
                 "rule": "documents",
@@ -171,6 +251,7 @@ def search(
         ),
         reverse=True,
     )
+    page = matches[offset : offset + limit]
     groups: dict[str, list] = {
         "documents": [],
         "projects": [],
@@ -178,16 +259,15 @@ def search(
         "posts": [],
         "proposals": [],
     }
-    for item in matches:
+    for item in page:
         groups[item["category"]].append(item)
-    counts = {key: len(value) for key, value in groups.items()}
-    try:
-        offset = int(cursor or 0)
-    except ValueError:
-        raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
-    if offset < 0 or offset > len(matches):
-        raise HTTPException(400, "cursor 값이 현재 검색 결과 범위를 벗어났습니다.")
-    page = matches[offset : offset + limit]
+    counts = {
+        "documents": counts_by_kind.get("doc", 0) + counts_by_kind.get("rule", 0),
+        "projects": counts_by_kind.get("project", 0),
+        "people": counts_by_kind.get("person", 0),
+        "posts": counts_by_kind.get("post", 0),
+        "proposals": counts_by_kind.get("proposal", 0),
+    }
     return envelope(
         {
             "query": needle,

@@ -93,29 +93,43 @@ def total_records(db: Session, kind: str) -> int:
     )
 
 
-def user_profile(db: Session, user: User) -> dict[str, Any]:
-    profile = db.scalar(
-        select(Resource).where(
-            Resource.resource_type == "profile", Resource.owner_id == user.id
+def user_profile(
+    db: Session,
+    user: User,
+    profile_data: dict[str, Any] | None = None,
+    projects_by_user: dict[str, list[list[str]]] | None = None,
+) -> dict[str, Any]:
+    joined_at = user.created_at
+    if joined_at and joined_at.tzinfo is None:
+        joined_at = joined_at.replace(tzinfo=timezone.utc)
+    if profile_data is None:
+        profile = db.scalar(
+            select(Resource).where(
+                Resource.resource_type == "profile", Resource.owner_id == user.id
+            )
         )
-    )
-    data = profile.payload if profile else {}
+        data = profile.payload if profile else {}
+    else:
+        data = profile_data
     projects = data.get("projects")
     if projects is None:
-        projects = []
-        for project in db.scalars(
-            select(Resource).where(Resource.resource_type == "project")
-        ):
-            member_ids = {
-                str(member_id) for member_id in project.payload.get("memberIds", [])
-            }
-            if str(user.id) in member_ids:
-                projects.append(
-                    [
-                        project.payload.get("name", ""),
-                        project.payload.get("role", "Member"),
-                    ]
-                )
+        if projects_by_user is not None:
+            projects = projects_by_user.get(str(user.id), [])
+        else:
+            projects = []
+            for project in db.scalars(
+                select(Resource).where(Resource.resource_type == "project")
+            ):
+                member_ids = {
+                    str(member_id) for member_id in project.payload.get("memberIds", [])
+                }
+                if str(user.id) in member_ids:
+                    projects.append(
+                        [
+                            project.payload.get("name", ""),
+                            project.payload.get("role", "Member"),
+                        ]
+                    )
     return {
         "id": str(user.id),
         "name": user.name,
@@ -126,11 +140,11 @@ def user_profile(db: Session, user: User) -> dict[str, Any]:
         "cohort": data.get("cohort", ""),
         "github": data.get("github", ""),
         "photo": data.get("photo", ""),
-        "joined": iso(user.created_at),
+        "joined": iso(joined_at),
         "bio": data.get("bio", ""),
         "interests": data.get("interests", []),
         "projects": projects,
-        "isNew": bool(user.created_at and (utc_now() - user.created_at).days < 7),
+        "isNew": bool(joined_at and (utc_now() - joined_at).days < 7),
         "lead": bool(
             set(user.roles or []).intersection({"Leader", "Admin", "Lead", "부서 리드"})
         ),
@@ -163,7 +177,8 @@ def notify_user(
             Resource.owner_id == user_id,
         )
     )
-    if preferences and preferences.payload.get("kinds", {}).get(kind, True) is False:
+    notification_kinds = (preferences.payload.get("kinds") or {}) if preferences else {}
+    if notification_kinds.get(kind, True) is False:
         return
     valid_kinds = {"내 업무", "재정", "일정", "공지"}
     notification = {
@@ -176,22 +191,34 @@ def notify_user(
         "action": action,
     }
     create_record(db, "notification", notification, db.get(User, user_id))
-    if not _is_do_not_disturb(preferences.payload if preferences else {}):
+    preference_data = preferences.payload if preferences else {}
+    if preference_data.get("push", True) is not False and not _is_do_not_disturb(
+        preference_data
+    ):
         from app.services.push import send_push
 
-        send_push(db, user_id, notification)
+        send_push(db, user_id, notification, preference_data)
 
 
 def _is_do_not_disturb(preferences: dict[str, Any]) -> bool:
-    if not preferences.get("dnd"):
+    dnd_value = preferences.get("dnd", False)
+    dnd_settings = dnd_value if isinstance(dnd_value, dict) else {}
+    if not dnd_settings.get("enabled", bool(dnd_value)):
         return False
     try:
         local_now = datetime.now(ZoneInfo(settings.app_timezone))
-        start = time.fromisoformat(str(preferences.get("dndFrom", "23:00")))
-        end = time.fromisoformat(str(preferences.get("dndTo", "08:00")))
+        start = time.fromisoformat(
+            str(preferences.get("dndFrom", dnd_settings.get("from", "23:00")))
+        )
+        end = time.fromisoformat(
+            str(preferences.get("dndTo", dnd_settings.get("to", "08:00")))
+        )
     except (ValueError, KeyError):
         return False
-    days = set(preferences.get("dndDays") or [])
+    configured_days = preferences.get("dndDays", dnd_settings.get("days", [])) or []
+    if isinstance(configured_days, str):
+        configured_days = [configured_days]
+    days = set(configured_days)
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
     selected_today = (
         not days

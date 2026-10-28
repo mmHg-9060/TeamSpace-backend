@@ -21,7 +21,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title=settings.app_name, version="0.2.0", lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    version="0.2.0",
+    lifespan=lifespan,
+    docs_url="/api-docs",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_base_url, "http://127.0.0.1:3000"],

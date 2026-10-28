@@ -14,7 +14,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -29,7 +29,7 @@ from app.api.shared import (
     user_can_finance,
 )
 from app.core.config import settings
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models.resource import Resource
 from app.models.user import User
 from app.services.anonymity import (
@@ -147,9 +147,22 @@ def require_inquiry_access(user: User, inquiry: Resource) -> None:
         raise HTTPException(403, "해당 부서 문의를 처리할 권한이 없습니다.")
 
 
-def _announce(db: Session, kind: str, title: str, href: str):
-    for user in db.scalars(select(User)):
-        notify_user(db, user.id, kind, title, href)
+def _announce_all_users(kind: str, title: str, href: str) -> None:
+    with SessionLocal() as db:
+        user_ids = list(db.scalars(select(User.id)))
+        for user_id in user_ids:
+            try:
+                notify_user(db, user_id, kind, title, href)
+            except Exception:
+                logger.exception(
+                    "Could not notify user %s about an announcement", user_id
+                )
+
+
+def _announce(
+    background_tasks: BackgroundTasks, kind: str, title: str, href: str
+) -> None:
+    background_tasks.add_task(_announce_all_users, kind, title, href)
 
 
 @router.post("/admin/projects", status_code=201, summary="프로젝트 등록")
@@ -281,6 +294,7 @@ def download_file(
 @router.post("/admin/notices", status_code=201, summary="공지 작성")
 def create_notice(
     payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -299,7 +313,7 @@ def create_notice(
     }
     record = create_record(db, "notice", data, user)
     _announce(
-        db,
+        background_tasks,
         "공지",
         f"새 공지: {payload['title']}",
         f"/inhouse/community/notices/{record.id}",
@@ -311,6 +325,7 @@ def create_notice(
 def patch_notice(
     notice_id: str,
     payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -323,7 +338,7 @@ def patch_notice(
     )
     if any(key in payload for key in ("title", "body", "pinned", "mustRead")):
         _announce(
-            db,
+            background_tasks,
             "공지",
             f"공지 업데이트: {updated.payload.get('title', '')}",
             f"/inhouse/community/notices/{notice_id}",
@@ -359,6 +374,7 @@ def unconfirmed_notice(
 @router.post("/admin/events", status_code=201, summary="일정 등록")
 def create_event(
     payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -366,7 +382,9 @@ def create_event(
     if not payload.get("date") or not payload.get("title"):
         raise HTTPException(400, "일정 날짜와 제목을 입력해주세요.")
     record = create_record(db, "event", {**payload, "rsvpByUser": {}}, user)
-    _announce(db, "일정", f"새 일정: {payload['title']}", "/inhouse/my/calendar")
+    _announce(
+        background_tasks, "일정", f"새 일정: {payload['title']}", "/inhouse/my/calendar"
+    )
     return envelope({"id": str(record.id)}, "일정을 등록했습니다.", 201)
 
 
@@ -374,6 +392,7 @@ def create_event(
 def patch_event(
     event_id: str,
     payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -383,7 +402,7 @@ def patch_event(
     updated = update_record(db, event, {**event.payload, **payload})
     if any(previous.get(key) != updated.payload.get(key) for key in payload):
         _announce(
-            db,
+            background_tasks,
             "일정",
             f"일정이 변경됐어요: {updated.payload.get('title', previous.get('title', ''))}",
             "/inhouse/my/calendar",
@@ -394,6 +413,7 @@ def patch_event(
 @router.post("/admin/docs", status_code=201, summary="문서 등록 또는 개정")
 def create_or_revise_doc(
     payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -462,7 +482,7 @@ def create_or_revise_doc(
     update_record(db, existing, revised)
     if payload.get("notify", True):
         _announce(
-            db,
+            background_tasks,
             "공지",
             f"문서가 개정됐어요: {revised['title']}",
             f"/inhouse/documents/{slug}",
@@ -490,19 +510,28 @@ def admin_inquiries(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if "Admin" not in (user.roles or []) and not user.department:
+    is_admin = "Admin" in (user.roles or [])
+    if not is_admin and not user.department:
         raise HTTPException(403, "관리자 또는 담당 부서 권한이 필요합니다.")
-    records, next_cursor = list_records(db, "inquiry", cursor, min(limit * 5, 500))
-    items = [
-        {"id": str(r.id), **public_content_payload(r.payload)}
-        for r in records
-        if ("Admin" in (user.roles or []) or r.payload.get("dept") == user.department)
-        and (not status or r.payload.get("status") == status)
-    ]
+    stmt = select(Resource).where(Resource.resource_type == "inquiry")
+    if not is_admin:
+        stmt = stmt.where(Resource.payload["dept"].as_string() == user.department)
+    if status:
+        stmt = stmt.where(Resource.payload["status"].as_string() == status)
+    if cursor:
+        try:
+            stmt = stmt.where(Resource.id < int(cursor))
+        except ValueError:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    records = list(db.scalars(stmt.order_by(Resource.id.desc()).limit(limit + 1)))
+    page = records[:limit]
     return envelope(
         {
-            "items": items[:limit],
-            "nextCursor": next_cursor if len(items) > limit else None,
+            "items": [
+                {"id": str(record.id), **public_content_payload(record.payload)}
+                for record in page
+            ],
+            "nextCursor": str(page[-1].id) if len(records) > limit and page else None,
         }
     )
 
@@ -589,16 +618,20 @@ def get_reports(
     user: User = Depends(get_current_user),
 ):
     require_admin(user)
-    records, next_cursor = list_records(db, "report", cursor, min(limit * 5, 500))
-    items = [
-        {"id": str(r.id), **r.payload}
-        for r in records
-        if not status or r.payload.get("status") == status
-    ]
+    stmt = select(Resource).where(Resource.resource_type == "report")
+    if status:
+        stmt = stmt.where(Resource.payload["status"].as_string() == status)
+    if cursor:
+        try:
+            stmt = stmt.where(Resource.id < int(cursor))
+        except ValueError:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    records = list(db.scalars(stmt.order_by(Resource.id.desc()).limit(limit + 1)))
+    page = records[:limit]
     return envelope(
         {
-            "items": items[:limit],
-            "nextCursor": next_cursor if len(items) > limit else None,
+            "items": [{"id": str(record.id), **record.payload} for record in page],
+            "nextCursor": str(page[-1].id) if len(records) > limit and page else None,
         }
     )
 
@@ -646,33 +679,26 @@ def admin_proposals(
 ):
     if "Admin" not in (user.roles or []) and not user.department:
         raise HTTPException(403, "관리자 또는 담당 부서 권한이 필요합니다.")
-    stmt = (
-        select(Resource)
-        .where(Resource.resource_type == "proposal")
-        .order_by(Resource.id.desc())
-    )
+    stmt = select(Resource).where(Resource.resource_type == "proposal")
+    if "Admin" not in (user.roles or []):
+        stmt = stmt.where(Resource.payload["dept"].as_string() == user.department)
+    if status:
+        status_expr = func.coalesce(Resource.payload["status"].as_string(), "접수")
+        stmt = stmt.where(status_expr == status)
     if cursor:
         try:
             stmt = stmt.where(Resource.id < int(cursor))
         except ValueError:
             raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
-    records = list(db.scalars(stmt.limit(limit + 1)))
-    visible = [
-        record
-        for record in records
-        if (
-            "Admin" in (user.roles or [])
-            or record.payload.get("dept") == user.department
-        )
-        and (not status or record.payload.get("status", "접수") == status)
-    ]
+    records = list(db.scalars(stmt.order_by(Resource.id.desc()).limit(limit + 1)))
+    page = records[:limit]
     return envelope(
         {
             "items": [
                 {"id": str(record.id), **public_content_payload(record.payload)}
-                for record in visible[:limit]
+                for record in page
             ],
-            "nextCursor": str(visible[limit - 1].id) if len(visible) > limit else None,
+            "nextCursor": str(page[-1].id) if len(records) > limit and page else None,
         }
     )
 

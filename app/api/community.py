@@ -1,11 +1,11 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import Integer, String, and_, cast, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from app.api.dependencies import get_current_user
 from app.api.shared import (
@@ -33,18 +33,37 @@ REPORT_REASONS = {"욕설·비하", "개인정보 노출", "도배·광고", "�
 
 
 def _post_view(
-    record: Resource, db: Session, viewer: User, detail: bool = False
+    record: Resource,
+    db: Session,
+    viewer: User,
+    detail: bool = False,
+    comment_count: int | None = None,
+    author_name: str | None = None,
+    author_preloaded: bool = False,
 ) -> dict[str, Any]:
     data = record.payload
-    author = db.get(User, record.owner_id) if record.owner_id else None
-    comments = list(
-        db.scalars(
-            select(Resource).where(
-                Resource.resource_type == "comment",
-                Resource.payload["postId"].as_string() == str(record.id),
+    anonymous = bool(data.get("anonymous") or data.get("isAnonymous"))
+    author = (
+        db.get(User, record.owner_id)
+        if record.owner_id and not anonymous and not author_preloaded
+        else None
+    )
+    comments = (
+        list(
+            db.scalars(
+                select(Resource)
+                .where(
+                    Resource.resource_type == "comment",
+                    Resource.payload["postId"].as_string() == str(record.id),
+                )
+                .order_by(Resource.id.asc())
             )
         )
+        if detail
+        else []
     )
+    if comment_count is None:
+        comment_count = len(comments)
     result = {
         "id": str(record.id),
         "category": data.get("category", "자유"),
@@ -58,23 +77,55 @@ def _post_view(
         "when": iso(record.created_at),
         "pinned": bool(data.get("pinned", False)),
         "mine": is_record_owner(record, viewer),
-        "commentCount": len(comments),
+        "commentCount": comment_count,
         "attachments": data.get("attachments", []),
     }
     if not result["anonymous"]:
-        result["author"] = author.name if author else "알 수 없음"
+        result["author"] = author_name or (author.name if author else "알 수 없음")
     if detail:
+        comment_owner_ids = {
+            comment.owner_id
+            for comment in comments
+            if comment.owner_id and not comment.payload.get("anonymous")
+        }
+        comment_author_names = (
+            {
+                comment_author.id: comment_author.name
+                for comment_author in db.scalars(
+                    select(User).where(User.id.in_(comment_owner_ids))
+                )
+            }
+            if comment_owner_ids
+            else {}
+        )
         result["comments"] = [
-            _comment_view(c, db, viewer, bool(data.get("anonymous"))) for c in comments
+            _comment_view(
+                comment,
+                db,
+                viewer,
+                bool(data.get("anonymous")),
+                author_name=comment_author_names.get(comment.owner_id),
+                author_preloaded=True,
+            )
+            for comment in comments
         ]
     return result
 
 
 def _comment_view(
-    record: Resource, db: Session, viewer: User, post_anonymous: bool = False
+    record: Resource,
+    db: Session,
+    viewer: User,
+    post_anonymous: bool = False,
+    author_name: str | None = None,
+    author_preloaded: bool = False,
 ) -> dict[str, Any]:
     data = record.payload
-    author = db.get(User, record.owner_id) if record.owner_id else None
+    author = (
+        db.get(User, record.owner_id)
+        if record.owner_id and not data.get("anonymous") and not author_preloaded
+        else None
+    )
     result = {
         "id": str(record.id),
         "postId": str(data.get("postId", "")),
@@ -88,7 +139,7 @@ def _comment_view(
     if post_anonymous and data.get("isPostAuthor"):
         result["author"] = "글쓴이"
     elif not data.get("anonymous"):
-        result["author"] = author.name if author else "알 수 없음"
+        result["author"] = author_name or (author.name if author else "알 수 없음")
     result["mine"] = is_record_owner(record, viewer)
     return result
 
@@ -116,13 +167,21 @@ def get_posts(
         raise HTTPException(400, "임시 저장 글은 mine=true로만 조회할 수 있습니다.")
     if period not in {"all", "today", "week", "month"}:
         raise HTTPException(400, "period는 all, today, week, month 중 하나여야 합니다.")
-    records = list(
-        db.scalars(
-            select(Resource)
-            .where(Resource.resource_type == "post")
-            .order_by(Resource.id.desc())
+    stmt = select(Resource).where(Resource.resource_type == "post")
+    status_expr = func.coalesce(Resource.payload["status"].as_string(), "published")
+    stmt = stmt.where(status_expr == status)
+    if mine:
+        stmt = stmt.where(owner_filter(user))
+    if category:
+        stmt = stmt.where(Resource.payload["category"].as_string() == category)
+    if q:
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Resource.payload["title"].as_string().ilike(pattern),
+                Resource.payload["body"].as_string().ilike(pattern),
+            )
         )
-    )
     local_now = datetime.now(ZoneInfo(settings.app_timezone))
     period_start = {
         "today": local_now.replace(
@@ -141,62 +200,146 @@ def get_posts(
                 ) from None
     if from_date and to_date and from_date > to_date:
         raise HTTPException(400, "from은 to보다 늦을 수 없습니다.")
-    values = []
-    for record in records:
-        data = record.payload
-        record_status = data.get("status", "published")
-        if record_status != status:
-            continue
-        if mine and not is_record_owner(record, user):
-            continue
-        if not mine and record_status != "published":
-            continue
-        if category and data.get("category") != category:
-            continue
-        if period_start and record.created_at and record.created_at < period_start:
-            continue
-        created_date = (
-            record.created_at.astimezone(ZoneInfo(settings.app_timezone))
-            .date()
-            .isoformat()
-            if record.created_at
-            else ""
+    if period_start:
+        stmt = stmt.where(Resource.created_at >= period_start)
+    if from_date:
+        start = datetime.combine(
+            date.fromisoformat(from_date),
+            time.min,
+            tzinfo=ZoneInfo(settings.app_timezone),
+        ).astimezone(timezone.utc)
+        stmt = stmt.where(Resource.created_at >= start)
+    if to_date:
+        end = datetime.combine(
+            date.fromisoformat(to_date) + timedelta(days=1),
+            time.min,
+            tzinfo=ZoneInfo(settings.app_timezone),
+        ).astimezone(timezone.utc)
+        stmt = stmt.where(Resource.created_at < end)
+
+    pinned_expr = func.coalesce(Resource.payload["pinned"].as_boolean(), False)
+    if sort == "latest":
+        score_expr = Resource.created_at
+    elif sort == "likes":
+        score_expr = cast(
+            func.coalesce(Resource.payload["likes"].as_string(), "0"), Integer
         )
-        if from_date and created_date < from_date:
-            continue
-        if to_date and created_date > to_date:
-            continue
-        if (
-            q
-            and q.casefold()
-            not in (
-                str(data.get("title", "")) + " " + str(data.get("body", ""))
-            ).casefold()
-        ):
-            continue
-        values.append(_post_view(record, db, user))
-    sort_key = {
-        "latest": lambda x: x.get("createdAt") or "",
-        "likes": lambda x: x.get("likes", 0),
-        "comments": lambda x: x.get("commentCount", 0),
-    }[sort]
-    values.sort(
-        key=lambda x: (bool(x.get("pinned", False)), sort_key(x), int(x["id"])),
-        reverse=True,
-    )
+    else:
+        comment_resource = aliased(Resource)
+        score_expr = (
+            select(func.count())
+            .select_from(comment_resource)
+            .where(
+                comment_resource.resource_type == "comment",
+                comment_resource.payload["postId"].as_string()
+                == cast(Resource.id, String),
+            )
+            .correlate(Resource)
+            .scalar_subquery()
+        )
+    stmt = stmt.order_by(pinned_expr.desc(), score_expr.desc(), Resource.id.desc())
     start = 0
     if cursor:
-        positions = [index for index, item in enumerate(values) if item["id"] == cursor]
-        if not positions:
-            raise HTTPException(400, "cursor가 현재 게시글 목록에 없습니다.")
-        start = positions[0] + 1
-    page = values[start : start + limit]
+        if cursor.startswith("o:"):
+            try:
+                start = int(cursor[2:])
+            except ValueError:
+                raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+            if start < 0:
+                raise HTTPException(400, "cursor 값이 올바르지 않습니다.")
+            stmt = stmt.offset(start)
+        else:
+            # Keep accepting ID cursors issued before this endpoint used DB pagination.
+            try:
+                cursor_record = get_record(db, "post", cursor)
+            except HTTPException:
+                raise HTTPException(
+                    400, "cursor 값이 현재 게시글 목록에 없습니다."
+                ) from None
+            cursor_pinned = bool(cursor_record.payload.get("pinned", False))
+            if sort == "latest":
+                cursor_score = cursor_record.created_at
+            elif sort == "likes":
+                cursor_score = int(cursor_record.payload.get("likes", 0) or 0)
+            else:
+                cursor_score = (
+                    db.scalar(
+                        select(func.count())
+                        .select_from(Resource)
+                        .where(
+                            Resource.resource_type == "comment",
+                            Resource.payload["postId"].as_string() == cursor,
+                        )
+                    )
+                    or 0
+                )
+            stmt = stmt.where(
+                or_(
+                    pinned_expr < cursor_pinned,
+                    and_(
+                        pinned_expr == cursor_pinned,
+                        or_(
+                            score_expr < cursor_score,
+                            and_(
+                                score_expr == cursor_score,
+                                Resource.id < cursor_record.id,
+                            ),
+                        ),
+                    ),
+                )
+            )
+    records = list(db.scalars(stmt.limit(limit + 1)))
+    page_records = records[:limit]
+    counts = {str(record.id): 0 for record in page_records}
+    if page_records:
+        count_rows = db.execute(
+            select(
+                Resource.payload["postId"].as_string(),
+                func.count(Resource.id),
+            )
+            .where(
+                Resource.resource_type == "comment",
+                Resource.payload["postId"].as_string().in_(counts),
+            )
+            .group_by(Resource.payload["postId"].as_string())
+        )
+        counts.update({post_id: count for post_id, count in count_rows})
+    owner_ids = {
+        record.owner_id
+        for record in page_records
+        if record.owner_id and not record.payload.get("anonymous")
+    }
+    author_names = (
+        {
+            author.id: author.name
+            for author in db.scalars(select(User).where(User.id.in_(owner_ids)))
+        }
+        if owner_ids
+        else {}
+    )
+    items = [
+        _post_view(
+            record,
+            db,
+            user,
+            comment_count=counts[str(record.id)],
+            author_name=author_names.get(record.owner_id),
+            author_preloaded=True,
+        )
+        for record in page_records
+    ]
     return envelope(
         {
-            "items": page,
-            "nextCursor": page[-1]["id"]
-            if page and start + limit < len(values)
-            else None,
+            "items": items,
+            "nextCursor": f"o:{start + limit}"
+            if len(records) > limit and cursor and cursor.startswith("o:")
+            else (
+                f"o:{limit}"
+                if len(records) > limit and not cursor
+                else str(page_records[-1].id)
+                if len(records) > limit and page_records
+                else None
+            ),
         }
     )
 
@@ -265,20 +408,45 @@ def _proposal_comments(db: Session, proposal_id: int) -> list[Resource]:
 
 
 def _proposal_view(
-    proposal: Resource, db: Session, user: User, detail: bool = False
+    proposal: Resource,
+    db: Session,
+    user: User,
+    detail: bool = False,
+    reaction_count: int | None = None,
+    comment_count: int | None = None,
+    author_name: str | None = None,
+    author_preloaded: bool = False,
 ) -> dict[str, Any]:
     data = proposal.payload
     anonymous = bool(data.get("anonymous"))
-    author = db.get(User, proposal.owner_id) if proposal.owner_id else None
-    reactions = list(
-        db.scalars(
-            select(Resource).where(
-                Resource.resource_type == "proposal_recommend",
-                Resource.payload["proposalId"].as_string() == str(proposal.id),
+    author = (
+        db.get(User, proposal.owner_id)
+        if proposal.owner_id and not anonymous and not author_preloaded
+        else None
+    )
+    reactions = (
+        list(
+            db.scalars(
+                select(Resource).where(
+                    Resource.resource_type == "proposal_recommend",
+                    Resource.payload["proposalId"].as_string() == str(proposal.id),
+                )
             )
         )
+        if reaction_count is None
+        else []
     )
-    comments = _proposal_comments(db, proposal.id)
+    comments = _proposal_comments(db, proposal.id) if comment_count is None else []
+    likes = (
+        reaction_count
+        if reaction_count is not None
+        else len(reactions) or int(data.get("recommendCount", 0) or 0)
+    )
+    comments_total = (
+        comment_count
+        if comment_count is not None
+        else len(comments) + len(data.get("comments", []))
+    )
     result = {
         "id": str(proposal.id),
         "category": data.get("category", data.get("dept", "업무환경")),
@@ -286,18 +454,35 @@ def _proposal_view(
         "body": data.get("body", data.get("content", "")),
         "status": data.get("status", "접수"),
         "anonymous": anonymous,
-        "likes": len(reactions) or int(data.get("recommendCount", 0) or 0),
-        "recommendCount": len(reactions) or int(data.get("recommendCount", 0) or 0),
-        "commentCount": len(comments) + len(data.get("comments", [])),
+        "likes": likes,
+        "recommendCount": likes,
+        "commentCount": comments_total,
         "createdAt": iso(proposal.created_at),
         "mine": is_record_owner(proposal, user),
         "answer": data.get("answer"),
         "history": data.get("history", []),
     }
     if not anonymous:
-        result["author"] = author.name if author else data.get("author", "알 수 없음")
+        result["author"] = author_name or (
+            author.name if author else data.get("author", "알 수 없음")
+        )
         result["dept"] = author.department if author else data.get("dept", "")
     if detail:
+        comment_owner_ids = {
+            comment.owner_id
+            for comment in comments
+            if comment.owner_id and not comment.payload.get("anonymous")
+        }
+        comment_author_names = (
+            {
+                comment_author.id: comment_author.name
+                for comment_author in db.scalars(
+                    select(User).where(User.id.in_(comment_owner_ids))
+                )
+            }
+            if comment_owner_ids
+            else {}
+        )
         comment_items = []
         for comment in comments:
             comment_data = comment.payload
@@ -311,10 +496,9 @@ def _proposal_view(
             if data.get("anonymous") and comment_data.get("isProposalAuthor"):
                 item["author"] = "글쓴이"
             elif not comment_data.get("anonymous"):
-                comment_author = (
-                    db.get(User, comment.owner_id) if comment.owner_id else None
+                item["author"] = comment_author_names.get(
+                    comment.owner_id, "알 수 없음"
                 )
-                item["author"] = comment_author.name if comment_author else "알 수 없음"
             comment_items.append(item)
         for comment in data.get("comments", []):
             legacy_comment = public_content_payload(comment)
@@ -342,50 +526,109 @@ def get_proposals(
 ):
     if sort not in {"latest", "likes", "comments"}:
         raise HTTPException(400, "sort는 latest, likes, comments 중 하나여야 합니다.")
-    proposals = list(
-        db.scalars(
-            select(Resource)
-            .where(Resource.resource_type == "proposal")
-            .order_by(Resource.id.desc())
-        )
+    title_expr = func.coalesce(Resource.payload["title"].as_string(), "")
+    body_expr = func.coalesce(
+        Resource.payload["body"].as_string(),
+        Resource.payload["content"].as_string(),
+        "",
     )
-    values = []
-    for proposal in proposals:
-        data = proposal.payload
-        if category and data.get("category", data.get("dept")) != category:
-            continue
-        if status and data.get("status", "접수") != status:
-            continue
-        if (
-            q
-            and q.casefold()
-            not in (
-                str(data.get("title", ""))
-                + " "
-                + str(data.get("body", data.get("content", "")))
-            ).casefold()
-        ):
-            continue
-        values.append(_proposal_view(proposal, db, user))
-    sort_key = {
-        "latest": lambda item: item.get("createdAt") or "",
-        "likes": lambda item: item.get("likes", 0),
-        "comments": lambda item: item.get("commentCount", 0),
-    }[sort]
-    values.sort(key=lambda item: (sort_key(item), int(item["id"])), reverse=True)
+    filters = [Resource.resource_type == "proposal"]
+    if category:
+        filters.append(
+            func.coalesce(
+                Resource.payload["category"].as_string(),
+                Resource.payload["dept"].as_string(),
+                "",
+            )
+            == category
+        )
+    if status:
+        filters.append(
+            func.coalesce(Resource.payload["status"].as_string(), "접수") == status
+        )
+    if q:
+        pattern = f"%{q.strip()}%"
+        filters.append(or_(title_expr.ilike(pattern), body_expr.ilike(pattern)))
+    reactions = aliased(Resource)
+    comments = aliased(Resource)
+    reaction_count_expr = (
+        select(func.count(reactions.id))
+        .where(
+            reactions.resource_type == "proposal_recommend",
+            reactions.payload["proposalId"].as_string() == cast(Resource.id, String),
+        )
+        .correlate(Resource)
+        .scalar_subquery()
+    )
+    comment_count_expr = (
+        select(func.count(comments.id))
+        .where(
+            comments.resource_type == "proposal_comment",
+            comments.payload["proposalId"].as_string() == cast(Resource.id, String),
+        )
+        .correlate(Resource)
+        .scalar_subquery()
+    )
+    legacy_likes = cast(
+        func.coalesce(Resource.payload["recommendCount"].as_string(), "0"), Integer
+    )
+    likes_expr = func.coalesce(func.nullif(reaction_count_expr, 0), legacy_likes)
+    if sort == "latest":
+        score_expr = Resource.created_at
+    elif sort == "likes":
+        score_expr = likes_expr
+    else:
+        score_expr = comment_count_expr
     start = 0
     if cursor:
-        positions = [index for index, item in enumerate(values) if item["id"] == cursor]
-        if not positions:
-            raise HTTPException(400, "cursor가 현재 제안 목록에 없습니다.")
-        start = positions[0] + 1
-    page = values[start : start + limit]
+        if not cursor.startswith("o:"):
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.")
+        try:
+            start = int(cursor[2:])
+        except ValueError:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+        if start < 0:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.")
+    rows = list(
+        db.execute(
+            select(Resource, likes_expr, comment_count_expr)
+            .where(*filters)
+            .order_by(score_expr.desc(), Resource.id.desc())
+            .offset(start)
+            .limit(limit + 1)
+        )
+    )
+    page_rows = rows[:limit]
+    owner_ids = {
+        proposal.owner_id
+        for proposal, _, _ in page_rows
+        if proposal.owner_id and not proposal.payload.get("anonymous")
+    }
+    author_names = (
+        {
+            author.id: author.name
+            for author in db.scalars(select(User).where(User.id.in_(owner_ids)))
+        }
+        if owner_ids
+        else {}
+    )
+    page = [
+        _proposal_view(
+            proposal,
+            db,
+            user,
+            reaction_count=int(likes_count or 0),
+            comment_count=int(resource_comments or 0)
+            + len(proposal.payload.get("comments", [])),
+            author_name=author_names.get(proposal.owner_id),
+            author_preloaded=True,
+        )
+        for proposal, likes_count, resource_comments in page_rows
+    ]
     return envelope(
         {
             "items": page,
-            "nextCursor": page[-1]["id"]
-            if page and start + limit < len(values)
-            else None,
+            "nextCursor": f"o:{start + limit}" if len(rows) > limit and page else None,
         }
     )
 
@@ -639,6 +882,8 @@ def patch_post(
     post = get_record(db, "post", post_id)
     if not is_record_owner(post, user):
         raise HTTPException(403, "작성자만 게시글을 수정할 수 있습니다.")
+    if post.payload.get("status", "published") in {"hidden", "deleted"}:
+        raise HTTPException(409, "숨김 또는 삭제 처리된 게시글은 수정할 수 없습니다.")
     data = {**post.payload, **payload.model_dump(exclude_unset=True)}
     if "status" in payload.model_fields_set and payload.status is not None:
         data["status"] = _post_status(payload.status)
@@ -914,8 +1159,10 @@ def inquiry_comment(
 ):
     record = get_record(db, "inquiry", inquiry_id)
     is_owner = is_record_owner(record, user)
-    if not is_owner and not set(user.roles or []).intersection(
-        {"Admin", record.payload.get("dept")}
+    if (
+        "Admin" not in (user.roles or [])
+        and (not user.department or user.department != record.payload.get("dept"))
+        and not is_owner
     ):
         raise HTTPException(404, "문의를 찾을 수 없습니다.")
     text = payload.get("text", "").strip()
@@ -952,80 +1199,122 @@ def get_notices(
 ):
     if sort not in {"latest", "pinned"}:
         raise HTTPException(400, "sort는 latest 또는 pinned여야 합니다.")
+    filters = [Resource.resource_type == "notice"]
+    if kind:
+        filters.append(Resource.payload["kind"].as_string() == kind)
+    if pinned is not None:
+        filters.append(
+            func.coalesce(Resource.payload["pinned"].as_boolean(), False) == pinned
+        )
+    if must_read is not None:
+        filters.append(
+            func.coalesce(Resource.payload["mustRead"].as_boolean(), False) == must_read
+        )
+    if q:
+        pattern = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                Resource.payload["title"].as_string().ilike(pattern),
+                Resource.payload["body"].as_string().ilike(pattern),
+            )
+        )
+    pinned_expr = func.coalesce(Resource.payload["pinned"].as_boolean(), False)
+    base_stmt = select(Resource).where(*filters)
+    start = 0
+    if cursor:
+        if cursor.startswith("o:"):
+            try:
+                start = int(cursor[2:])
+            except ValueError:
+                raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+        else:
+            try:
+                cursor_record = get_record(db, "notice", cursor)
+            except HTTPException:
+                raise HTTPException(
+                    400, "cursor 값이 현재 공지 목록에 없습니다."
+                ) from None
+            cursor_pinned = bool(cursor_record.payload.get("pinned", False))
+            start = (
+                db.scalar(
+                    select(func.count())
+                    .select_from(Resource)
+                    .where(
+                        *filters,
+                        or_(
+                            pinned_expr > cursor_pinned,
+                            and_(
+                                pinned_expr == cursor_pinned,
+                                or_(
+                                    Resource.created_at > cursor_record.created_at,
+                                    and_(
+                                        Resource.created_at == cursor_record.created_at,
+                                        Resource.id > cursor_record.id,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+                or 0
+            )
+            start += 1
+        if start < 0:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.")
     records = list(
         db.scalars(
-            select(Resource)
-            .where(Resource.resource_type == "notice")
-            .order_by(Resource.id.desc())
+            base_stmt.order_by(
+                pinned_expr.desc(), Resource.created_at.desc(), Resource.id.desc()
+            )
+            .offset(start)
+            .limit(limit + 1)
         )
     )
-    confirmed = {
-        str(r.payload.get("noticeId"))
-        for r in db.scalars(
-            select(Resource).where(
-                Resource.resource_type == "notice_confirmation",
-                Resource.owner_id == user.id,
-            )
-        )
-    }
-    values = []
-    for record in records:
-        data = record.payload
-        if kind and data.get("kind") != kind:
-            continue
-        if pinned is not None and bool(data.get("pinned", False)) != pinned:
-            continue
-        if must_read is not None and bool(data.get("mustRead", False)) != must_read:
-            continue
-        if (
-            q
-            and q.casefold()
-            not in (
-                str(data.get("title", "")) + " " + str(data.get("body", ""))
-            ).casefold()
-        ):
-            continue
-        total = int(data.get("total", 0))
-        count = (
-            db.scalar(
-                select(func.count())
-                .select_from(Resource)
+    page = records[:limit]
+    notice_ids = [str(record.id) for record in page]
+    counts = {}
+    confirmed_by_me = set()
+    if notice_ids:
+        counts = dict(
+            db.execute(
+                select(
+                    Resource.payload["noticeId"].as_string(),
+                    func.count(Resource.id),
+                )
                 .where(
                     Resource.resource_type == "notice_confirmation",
-                    Resource.payload["noticeId"].as_string() == str(record.id),
+                    Resource.payload["noticeId"].as_string().in_(notice_ids),
+                )
+                .group_by(Resource.payload["noticeId"].as_string())
+            ).all()
+        )
+        confirmed_by_me = set(
+            db.scalars(
+                select(Resource.payload["noticeId"].as_string()).where(
+                    Resource.resource_type == "notice_confirmation",
+                    Resource.owner_id == user.id,
+                    Resource.payload["noticeId"].as_string().in_(notice_ids),
                 )
             )
-            or 0
         )
-        values.append(
+    items = []
+    for record in page:
+        data = record.payload
+        count = int(counts.get(str(record.id), 0))
+        items.append(
             {
                 "id": str(record.id),
                 **data,
                 "confirmed": count,
-                "total": total or count,
-                "confirmedByMe": str(record.id) in confirmed,
+                "total": int(data.get("total", 0)) or count,
+                "confirmedByMe": str(record.id) in confirmed_by_me,
             }
         )
-    values.sort(
-        key=lambda item: (
-            bool(item.get("pinned", False)),
-            item.get("createdAt", ""),
-            int(item["id"]),
-        ),
-        reverse=True,
-    )
-    start = 0
-    if cursor:
-        positions = [index for index, item in enumerate(values) if item["id"] == cursor]
-        if not positions:
-            raise HTTPException(400, "cursor가 현재 공지 목록에 없습니다.")
-        start = positions[0] + 1
-    page = values[start : start + limit]
     return envelope(
         {
-            "items": page,
-            "nextCursor": page[-1]["id"]
-            if page and start + limit < len(values)
+            "items": items,
+            "nextCursor": f"o:{start + limit}"
+            if len(records) > limit and page
             else None,
         }
     )

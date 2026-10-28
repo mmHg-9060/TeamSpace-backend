@@ -1,12 +1,13 @@
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from app.api.dependencies import get_current_user
 from app.api.shared import (
@@ -24,6 +25,7 @@ from app.services.email import EmailConfigurationError, EmailDeliveryError, send
 from app.services.security import hash_password
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ProfilePatch(BaseModel):
@@ -119,29 +121,57 @@ def get_people(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    stmt = select(User).order_by(User.id)
+    profile = aliased(Resource)
+    profile_dept = func.coalesce(
+        profile.payload["dept"].as_string(), User.department, ""
+    )
+    stmt = select(User, profile).outerjoin(
+        profile,
+        and_(profile.resource_type == "profile", profile.owner_id == User.id),
+    )
     if dept:
-        stmt = stmt.where(User.department == dept)
+        stmt = stmt.where(profile_dept == dept)
+    if q:
+        pattern = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(
+                User.name.ilike(pattern),
+                User.email.ilike(pattern),
+                profile_dept.ilike(pattern),
+                profile.payload["major"].as_string().ilike(pattern),
+                profile.payload["bio"].as_string().ilike(pattern),
+            )
+        )
     if cursor:
         try:
             stmt = stmt.where(User.id > int(cursor))
         except ValueError:
             raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
-    users = list(db.scalars(stmt))
-    data = [user_profile(db, person) for person in users]
-    if q:
-        needle = q.casefold()
-        data = [
-            p
-            for p in data
-            if needle
-            in " ".join(
-                [p["name"], p["email"], p["dept"], p["role"], p["bio"]]
-            ).casefold()
-        ]
-    page = data[:limit]
-    next_cursor = page[-1]["id"] if len(data) > limit else None
-    return envelope({"items": page, "nextCursor": next_cursor})
+    rows = list(db.execute(stmt.order_by(User.id).limit(limit + 1)).all())
+    page = rows[:limit]
+    projects_by_user: dict[str, list[list[str]]] = {}
+    for project in db.scalars(
+        select(Resource).where(Resource.resource_type == "project")
+    ):
+        for member_id in project.payload.get("memberIds", []):
+            projects_by_user.setdefault(str(member_id), []).append(
+                [project.payload.get("name", ""), project.payload.get("role", "Member")]
+            )
+    items = [
+        user_profile(
+            db,
+            person,
+            profile.payload if profile else {},
+            projects_by_user,
+        )
+        for person, profile in page
+    ]
+    return envelope(
+        {
+            "items": items,
+            "nextCursor": str(page[-1][0].id) if len(rows) > limit and page else None,
+        }
+    )
 
 
 @router.get("/people/{person_id}", summary="팀원 상세")
@@ -206,13 +236,28 @@ def send_reset_email(email: str, token: str) -> None:
         ) from exc
 
 
+def _deliver_reset_email(email: str, token: str) -> None:
+    try:
+        send_reset_email(email, token)
+    except HTTPException as exc:
+        logger.warning(
+            "Password reset email delivery failed with HTTP status %s",
+            exc.status_code,
+        )
+
+
 @router.post(
     "/auth/password-reset-requests",
     status_code=202,
     summary="비밀번호 재설정 메일 요청",
 )
-def password_reset_request(payload: ResetRequest, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == str(payload.email)))
+def password_reset_request(
+    payload: ResetRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    email = str(payload.email).strip().casefold()
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
     # Avoid exposing whether an account exists.
     if user is None:
         return envelope({"accepted": True}, "요청을 처리했습니다.", 202)
@@ -228,7 +273,7 @@ def password_reset_request(payload: ResetRequest, db: Session = Depends(get_db))
             "used": False,
         },
     )
-    send_reset_email(user.email, token)
+    background_tasks.add_task(_deliver_reset_email, user.email, token)
     return envelope({"accepted": True}, "요청을 처리했습니다.", 202)
 
 

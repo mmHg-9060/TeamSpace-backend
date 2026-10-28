@@ -4,7 +4,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import Numeric, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -13,7 +14,6 @@ from app.api.shared import (
     envelope,
     get_record,
     iso,
-    list_records,
     notify_user,
     require_finance,
     update_record,
@@ -23,6 +23,7 @@ from app.models.bank import BankSyncRun
 from app.models.resource import Resource
 from app.models.user import User
 from app.services.anonymity import is_record_owner
+from app.services.money import parse_money
 
 router = APIRouter()
 
@@ -117,33 +118,33 @@ def get_approvals(
 ):
     if box not in {"mine", "received", "handled"}:
         raise HTTPException(400, "box는 mine, received, handled 중 하나여야 합니다.")
-    records, _ = list_records(db, "approval", cursor, min(limit * 3, 300))
-    selected = []
-    for record in records:
-        data = record.payload
-        line = data.get("line", [])
-        is_received = any(
-            int(step.get("userId", 0) or 0) == user.id
-            and step.get("state") in {"now", "wait"}
-            for step in line
-        )
-        if box == "mine" and record.owner_id != user.id:
-            continue
-        if box == "received" and not is_received:
-            continue
-        if box == "handled" and not any(
-            int(step.get("userId", 0) or 0) == user.id and step.get("state") == "done"
-            for step in line
-        ):
-            continue
-        if status_filter and data.get("status") != status_filter:
-            continue
-        selected.append(_approval_item(record, db, user))
-    page = selected[:limit]
+    stmt = select(Resource).where(Resource.resource_type == "approval")
+    if box == "mine":
+        stmt = stmt.where(Resource.owner_id == user.id)
+    else:
+        line = cast(Resource.payload["line"], JSONB)
+        if box == "received":
+            stmt = stmt.where(
+                or_(
+                    line.contains([{"userId": user.id, "state": "now"}]),
+                    line.contains([{"userId": user.id, "state": "wait"}]),
+                )
+            )
+        else:
+            stmt = stmt.where(line.contains([{"userId": user.id, "state": "done"}]))
+    if status_filter:
+        stmt = stmt.where(Resource.payload["status"].as_string() == status_filter)
+    if cursor:
+        try:
+            stmt = stmt.where(Resource.id < int(cursor))
+        except ValueError:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    records = list(db.scalars(stmt.order_by(Resource.id.desc()).limit(limit + 1)))
+    page = records[:limit]
     return envelope(
         {
-            "items": page,
-            "nextCursor": page[-1]["id"] if len(selected) > limit and page else None,
+            "items": [_approval_item(record, db, user) for record in page],
+            "nextCursor": str(page[-1].id) if len(records) > limit and page else None,
         }
     )
 
@@ -183,6 +184,46 @@ class ApprovalCreate(BaseModel):
     costType: str = ""
 
     model_config = ConfigDict(extra="allow")
+
+
+class ApprovalPatch(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    type: str | None = None
+    amount: int | str | None = None
+    status: str | None = None
+    project: str | None = None
+    useDate: str | None = None
+    reason: str | None = None
+    files: list[Any] | None = None
+    staff: dict[str, int] | None = None
+    period: str | None = None
+    details: dict[str, Any] | None = None
+    schedule: dict[str, Any] | None = None
+    budget: dict[str, Any] | None = None
+    personnel: list[dict[str, Any]] | None = None
+    costType: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _parse_amount(value: Any) -> int:
+    try:
+        amount = parse_money(value)
+    except ValueError:
+        raise HTTPException(422, "금액 형식이 올바르지 않습니다.") from None
+    if amount < 0:
+        raise HTTPException(422, "금액은 0 이상의 유효한 숫자여야 합니다.")
+    return amount
+
+
+def _nonnegative_money(value: Any, field: str) -> int:
+    try:
+        amount = parse_money(value)
+    except ValueError:
+        raise HTTPException(422, f"{field} 금액 형식이 올바르지 않습니다.") from None
+    if amount < 0:
+        raise HTTPException(422, f"{field} 금액은 0 이상이어야 합니다.")
+    return amount
 
 
 @router.post("/approvals", status_code=201, summary="결재 작성 또는 임시 저장")
@@ -233,10 +274,7 @@ def create_approval(
     ):
         raise HTTPException(422, "요청 사유를 입력해주세요.")
     amount_source = payload.amount or payload.budget.get("amount", 0)
-    try:
-        amount = int(str(amount_source).replace(",", "").replace("원", ""))
-    except ValueError:
-        amount = 0
+    amount = _parse_amount(amount_source)
     line = [
         {
             "who": user.name,
@@ -306,7 +344,7 @@ def create_approval(
 @router.patch("/approvals/{approval_id}", summary="결재 수정")
 def patch_approval(
     approval_id: str,
-    payload: dict[str, Any],
+    payload: ApprovalPatch,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -316,18 +354,41 @@ def patch_approval(
         "반려",
     }:
         raise HTTPException(403, "작성 중이거나 반려된 본인 결재만 수정할 수 있습니다.")
-    data = {**record.payload, **payload}
-    if "files" in payload:
-        data["files"] = _approval_files(db, list(payload.get("files") or []), user)
-    if payload.get("status") == "결재 대기":
-        amount_value = data.get("amountValue", data.get("amount", 0))
-        try:
-            amount_value = int(str(amount_value).replace(",", "").replace("원", ""))
-        except ValueError:
-            amount_value = 0
+    changes = payload.model_dump(exclude_unset=True)
+    requested_status = changes.get("status")
+    if requested_status not in {None, "작성 중", "결재 대기"}:
+        raise HTTPException(
+            422, "결재 상태는 작성 중 또는 결재 제출만 설정할 수 있습니다."
+        )
+    data = {**record.payload, **changes}
+    if "files" in changes:
+        data["files"] = _approval_files(db, list(changes.get("files") or []), user)
+    if changes.get("status") == "결재 대기":
+        if not str(data.get("title", "")).strip():
+            raise HTTPException(422, "결재 제목을 입력해주세요.")
+        if (
+            data.get("kind") == "인력 지원"
+            and not data.get("staff")
+            and not data.get("personnel")
+        ):
+            raise HTTPException(422, "지원할 직군과 인원을 입력해주세요.")
+        if (
+            data.get("kind") in {"프로젝트 요청", "운영 요청", "기타 내부 문서"}
+            and not str(data.get("reason", "")).strip()
+        ):
+            raise HTTPException(422, "요청 사유를 입력해주세요.")
+        amount_source = data.get("amount") or (data.get("budget") or {}).get(
+            "amount", 0
+        )
+        amount_value = (
+            0 if data.get("kind") == "인력 지원" else _parse_amount(amount_source)
+        )
         approvers = _approvers(db, data.get("kind", "비용 승인"), amount_value, user.id)
         if not approvers:
             raise HTTPException(409, "결재선을 구성할 다른 담당자 계정이 없습니다.")
+        data["amountValue"] = amount_value
+        if data.get("kind") != "인력 지원":
+            data["amount"] = f"{amount_value:,}원"
         data["approverIds"] = [a.id for a in approvers]
         data["line"] = [
             {
@@ -347,9 +408,27 @@ def patch_approval(
             }
             for i, a in enumerate(approvers)
         ]
-        data["status"] = "검토 중" if approvers else "결재 대기"
+        data["status"] = "검토 중"
+        data.pop("rejectReason", None)
+    elif changes.get("status") == "작성 중":
+        data["status"] = "작성 중"
+        data["approverIds"] = []
+        data["line"] = [
+            {
+                "who": user.name,
+                "userId": user.id,
+                "role": "기안",
+                "state": "done",
+                "at": iso(datetime.now().astimezone()),
+            }
+        ]
+        data.pop("rejectReason", None)
     update_record(db, record, data)
-    first = (data.get("approverIds") or [None])[0]
+    first = (
+        (data.get("approverIds") or [None])[0]
+        if changes.get("status") == "결재 대기"
+        else None
+    )
     if first:
         _notify_approval(db, record, first, f"새 결재 요청: {data.get('title', '')}")
     return envelope(_approval_item(record, db, user), "결재를 수정했습니다.")
@@ -631,38 +710,50 @@ def get_receipts(
     user: User = Depends(get_current_user),
 ):
     require_finance(user)
-    records, next_cursor = list_records(
-        db, "finance_receipt", cursor, min(limit * 4, 400)
+    for value in (from_date, to_date):
+        if value:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                raise HTTPException(
+                    400, "from과 to는 YYYY-MM-DD 형식이어야 합니다."
+                ) from None
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(400, "from은 to보다 늦을 수 없습니다.")
+    base_filters = [Resource.resource_type == "finance_receipt"]
+    if from_date:
+        base_filters.append(Resource.payload["date"].as_string() >= from_date)
+    if to_date:
+        base_filters.append(Resource.payload["date"].as_string() <= to_date)
+    amount = cast(Resource.payload["amount"].as_string(), Numeric(20, 0))
+    summary_rows = db.execute(
+        select(Resource.payload["status"].as_string(), func.sum(amount))
+        .where(*base_filters)
+        .group_by(Resource.payload["status"].as_string())
     )
-    filtered = [
-        r
-        for r in records
-        if (not from_date or str(r.payload.get("date", "")) >= from_date)
-        and (not to_date or str(r.payload.get("date", "")) <= to_date)
-    ]
-    totals = {
-        "totalOrder": sum(int(r.payload.get("amount", 0)) for r in filtered),
-        "paid": sum(
-            int(r.payload.get("amount", 0))
-            for r in filtered
-            if r.payload.get("status") == "입금 완료"
-        ),
-        "pending": sum(
-            int(r.payload.get("amount", 0))
-            for r in filtered
-            if r.payload.get("status") in {"입금 대기", "청구 완료"}
-        ),
-        "overdue": sum(
-            int(r.payload.get("amount", 0))
-            for r in filtered
-            if r.payload.get("status") == "연체"
-        ),
-    }
-    page = [{"id": str(r.id), **r.payload} for r in filtered[:limit]]
+    totals = {"totalOrder": 0, "paid": 0, "pending": 0, "overdue": 0}
+    for status, amount_total in summary_rows:
+        amount_total = int(amount_total or 0)
+        totals["totalOrder"] += amount_total
+        if status == "입금 완료":
+            totals["paid"] += amount_total
+        elif status in {"입금 대기", "청구 완료"}:
+            totals["pending"] += amount_total
+        elif status == "연체":
+            totals["overdue"] += amount_total
+
+    stmt = select(Resource).where(*base_filters)
+    if cursor:
+        try:
+            stmt = stmt.where(Resource.id < int(cursor))
+        except ValueError:
+            raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    records = list(db.scalars(stmt.order_by(Resource.id.desc()).limit(limit + 1)))
+    page = records[:limit]
     return envelope(
         {
-            "items": page,
-            "nextCursor": next_cursor if len(filtered) > limit else None,
+            "items": [{"id": str(record.id), **record.payload} for record in page],
+            "nextCursor": str(page[-1].id) if len(records) > limit and page else None,
             "totals": totals,
         }
     )
@@ -696,7 +787,8 @@ def create_receipt(
     for key in ("client", "project", "amount", "status", "date"):
         if key not in payload:
             raise HTTPException(400, f"{key} 항목은 필수입니다.")
-    record = create_record(db, "finance_receipt", payload, user)
+    data = {**payload, "amount": _nonnegative_money(payload["amount"], "수금")}
+    record = create_record(db, "finance_receipt", data, user)
     return envelope(
         {"id": str(record.id), **record.payload}, "수금 내역을 등록했습니다.", 201
     )
@@ -712,7 +804,10 @@ def patch_receipt(
     if "Admin" not in (user.roles or []) and "FA" not in (user.roles or []):
         raise HTTPException(403, "수금 변경 권한이 없습니다.")
     record = get_record(db, "finance_receipt", receipt_id)
-    updated = update_record(db, record, {**record.payload, **payload})
+    changes = dict(payload)
+    if "amount" in changes:
+        changes["amount"] = _nonnegative_money(changes["amount"], "수금")
+    updated = update_record(db, record, {**record.payload, **changes})
     return envelope(
         {"id": str(updated.id), **updated.payload}, "수금 내역을 수정했습니다."
     )
@@ -737,7 +832,11 @@ def create_contract(
     )
     if existing:
         raise HTTPException(409, "해당 프로젝트의 계약 정보가 이미 등록되어 있습니다.")
-    record = create_record(db, "finance_contract", payload, user)
+    data = dict(payload)
+    for key in ("totalAmount", "amount", "total", "collectedAmount", "collected"):
+        if key in data and data[key] is not None:
+            data[key] = _nonnegative_money(data[key], "계약")
+    record = create_record(db, "finance_contract", data, user)
     return envelope(
         {"id": str(record.id), **record.payload}, "계약 정보를 등록했습니다.", 201
     )
@@ -761,7 +860,11 @@ def patch_contract(
     )
     if contract is None:
         raise HTTPException(404, "계약 정보를 찾을 수 없습니다.")
-    updated = update_record(db, contract, {**contract.payload, **payload})
+    changes = dict(payload)
+    for key in ("totalAmount", "amount", "total", "collectedAmount", "collected"):
+        if key in changes and changes[key] is not None:
+            changes[key] = _nonnegative_money(changes[key], "계약")
+    updated = update_record(db, contract, {**contract.payload, **changes})
     return envelope(updated.payload, "계약 정보를 수정했습니다.")
 
 
@@ -791,7 +894,25 @@ def patch_finance_settings(
         select(Resource).where(Resource.resource_type == "finance_settings")
     )
     if record:
-        data = update_record(db, record, {**record.payload, **payload})
+        changes = dict(payload)
+        if "pools" in changes:
+            changes["pools"] = [
+                {
+                    **pool,
+                    "amount": _nonnegative_money(pool.get("amount", 0), "풀"),
+                }
+                for pool in changes["pools"]
+            ]
+        data = update_record(db, record, {**record.payload, **changes})
     else:
-        data = create_record(db, "finance_settings", payload)
+        changes = dict(payload)
+        if "pools" in changes:
+            changes["pools"] = [
+                {
+                    **pool,
+                    "amount": _nonnegative_money(pool.get("amount", 0), "풀"),
+                }
+                for pool in changes["pools"]
+            ]
+        data = create_record(db, "finance_settings", changes)
     return envelope(data.payload, "재무 설정을 저장했습니다.")

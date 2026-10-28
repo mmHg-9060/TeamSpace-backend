@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,7 @@ from app.models.bank import BankImport, BankSyncRun
 from app.models.resource import Resource
 from app.models.user import User
 from app.services.bank import BankProviderUnavailable, fetch_transactions
+from app.services.money import parse_money
 
 router = APIRouter()
 KST = ZoneInfo("Asia/Seoul")
@@ -33,14 +34,10 @@ def _require_finance_admin(user: User) -> None:
 
 
 def _money(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, str):
-        value = re.sub(r"[^0-9-]", "", value)
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+        return parse_money(value)
+    except ValueError as exc:
+        raise HTTPException(422, "금액 형식이 올바르지 않습니다.") from exc
 
 
 def _aware_datetime(value: Any) -> datetime:
@@ -217,16 +214,25 @@ def get_bank_account(
     if not user_can_finance(user):
         raise HTTPException(403, "재정 정보 열람 권한이 없습니다.")
     now_kst = datetime.now(KST)
-    current_month = now_kst.strftime("%Y-%m")
-    imports = list(db.scalars(select(BankImport)))
-    month_rows = [
-        r
-        for r in imports
-        if r.transaction_at.astimezone(KST).strftime("%Y-%m") == current_month
-    ]
+    month_start = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if month_start.month == 12:
+        month_end = month_start.replace(year=month_start.year + 1, month=1)
+    else:
+        month_end = month_start.replace(month=month_start.month + 1)
+    month_counts = dict(
+        db.execute(
+            select(BankImport.direction, func.count(BankImport.id))
+            .where(
+                BankImport.transaction_at >= month_start.astimezone(timezone.utc),
+                BankImport.transaction_at < month_end.astimezone(timezone.utc),
+            )
+            .group_by(BankImport.direction)
+        ).all()
+    )
     runs = list(
         db.scalars(select(BankSyncRun).order_by(BankSyncRun.id.desc()).limit(5))
     )
+    last_synced = last_successful_sync(db)
     configured = bool(
         settings.bank_provider
         and settings.bank_account_number
@@ -246,14 +252,10 @@ def get_bank_account(
             "provider": settings.bank_provider,
             "accountNumber": masked,
             "alias": settings.bank_account_alias,
-            "lastSyncedAt": (
-                last_successful_sync(db).isoformat()
-                if last_successful_sync(db)
-                else None
-            ),
+            "lastSyncedAt": last_synced.isoformat() if last_synced else None,
             "thisMonth": {
-                "inboundCount": sum(r.direction == "입금" for r in month_rows),
-                "outboundCount": sum(r.direction == "출금" for r in month_rows),
+                "inboundCount": int(month_counts.get("입금", 0)),
+                "outboundCount": int(month_counts.get("출금", 0)),
             },
             "consecutiveFailures": _consecutive_failures(db),
             "recentFailures": [
