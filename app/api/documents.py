@@ -5,12 +5,26 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
-from app.api.shared import create_record, envelope, iso, list_records
+from app.api.shared import (
+    create_record,
+    envelope,
+    iso,
+    list_records,
+    user_can_finance,
+)
 from app.db.session import get_db
 from app.models.resource import Resource
 from app.models.user import User
 
 router = APIRouter()
+
+
+def _require_doc_access(data: dict, user: User) -> None:
+    if (
+        str(data.get("type", "")).upper() == "FINANCE"
+        or str(data.get("category", "")).upper() == "FINANCE"
+    ) and not user_can_finance(user):
+        raise HTTPException(403, "재무 문서를 열람할 권한이 없습니다.")
 
 
 def _doc(db: Session, slug: str) -> Resource:
@@ -33,12 +47,17 @@ def get_docs(
     cursor: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     records, next_cursor = list_records(db, "doc", cursor, min(limit * 4, 400))
     docs = []
     for record in records:
         data = record.payload
+        if (
+            str(data.get("type", "")).upper() == "FINANCE"
+            or str(data.get("category", "")).upper() == "FINANCE"
+        ) and not user_can_finance(user):
+            continue
         if category and data.get("category") != category:
             continue
         if type and data.get("type") != type:
@@ -80,7 +99,7 @@ def get_doc(
     slug: str,
     version: str | None = None,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     record = _doc(db, slug)
     data = record.payload
@@ -95,6 +114,7 @@ def get_doc(
         if history is None:
             raise HTTPException(404, "요청한 문서 버전을 찾을 수 없습니다.")
         data = history.payload.get("document", data)
+    _require_doc_access(data, user)
     result = {**data}
     if data.get("type") == "TEMPLATE":
         result.setdefault("fields", data.get("fields", []))
@@ -110,9 +130,10 @@ def get_doc_history(
     cursor: str | None = None,
     limit: int = Query(50, ge=1, le=100),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    _doc(db, slug)
+    document = _doc(db, slug)
+    _require_doc_access(document.payload, user)
     records, next_cursor = list_records(db, "doc_revision", cursor, min(limit * 5, 500))
     history = [r.payload for r in records if r.payload.get("slug") == slug]
     if version:
@@ -139,7 +160,8 @@ def get_doc_history(
 def read_doc(
     slug: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    _doc(db, slug)
+    document = _doc(db, slug)
+    _require_doc_access(document.payload, user)
     receipt = db.scalar(
         select(Resource).where(
             Resource.resource_type == "doc_read",

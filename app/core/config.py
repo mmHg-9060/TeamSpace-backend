@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 14
     frontend_base_url: str = "http://localhost:3000"
+    anonymous_author_secret: str | None = None
+    app_timezone: str = "Asia/Seoul"
 
     smtp_host: str | None = None
     smtp_port: int = 587

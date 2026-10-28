@@ -1,49 +1,362 @@
-from datetime import datetime
-from typing import Any
+from datetime import date, datetime, timezone
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
-from app.api.shared import create_record, envelope, iso, list_records, update_record
+from app.api.shared import (
+    create_record,
+    envelope,
+    get_record,
+    iso,
+    update_record,
+    user_can_finance,
+    user_profile,
+)
 from app.db.session import get_db
 from app.models.resource import Resource
 from app.models.user import User
+from app.services.anonymity import owner_filter
 from app.services.security import hash_password, verify_password
 
 router = APIRouter()
 
 
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    dueDate: str | None = None
+    dueAt: str | None = None
+    projectId: str | None = None
+    projectName: str | None = None
+    category: Literal["개인 업무", "프로젝트 업무", "결재", "일정"] = "개인 업무"
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class TodoPatch(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    dueDate: str | None = None
+    dueAt: str | None = None
+    projectId: str | None = None
+    projectName: str | None = None
+    category: Literal["개인 업무", "프로젝트 업무", "결재", "일정"] | None = None
+    description: str | None = Field(default=None, max_length=2000)
+    status: Literal["미완료", "예정", "완료"] | None = None
+
+
+def _todo_item(record: Resource) -> dict[str, Any]:
+    return {
+        "id": str(record.id),
+        **record.payload,
+        "createdAt": iso(record.created_at),
+        "updatedAt": iso(record.updated_at),
+    }
+
+
+def _todo_items(db: Session, user: User) -> list[dict[str, Any]]:
+    records = list(
+        db.scalars(
+            select(Resource)
+            .where(Resource.resource_type == "todo", Resource.owner_id == user.id)
+            .order_by(Resource.id.desc())
+        )
+    )
+    items = [_todo_item(record) for record in records]
+    approvals = db.scalars(
+        select(Resource)
+        .where(Resource.resource_type == "approval")
+        .order_by(Resource.id.desc())
+    )
+    for approval in approvals:
+        if approval.payload.get("status") not in {"결재 대기", "검토 중"}:
+            continue
+        current = next(
+            (
+                step
+                for step in approval.payload.get("line", [])
+                if str(step.get("userId")) == str(user.id)
+                and step.get("state") == "now"
+            ),
+            None,
+        )
+        if current is None:
+            continue
+        items.append(
+            {
+                "id": f"approval:{approval.id}",
+                "title": f"{approval.payload.get('title', '결재 요청')} 검토",
+                "status": "미완료",
+                "category": "결재",
+                "projectId": approval.payload.get("projectId"),
+                "projectName": approval.payload.get("project", ""),
+                "sourceType": "approval",
+                "sourceId": str(approval.id),
+                "href": f"/inhouse/requests/{approval.id}",
+                "createdAt": iso(approval.created_at),
+                "updatedAt": iso(approval.updated_at),
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            item.get("dueDate") or "9999-12-31",
+            item.get("createdAt") or "",
+            item["id"],
+        )
+    )
+    return items
+
+
+@router.get("/todos", summary="내 할 일 목록")
+@router.get("/me/todos", summary="내 할 일 목록", include_in_schema=False)
+def get_todos(
+    status: str | None = None,
+    date_value: str | None = Query(None, alias="date"),
+    cursor: str | None = None,
+    limit: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if status and status not in {"미완료", "예정", "완료"}:
+        raise HTTPException(400, "할 일 상태가 올바르지 않습니다.")
+    if date_value:
+        try:
+            date.fromisoformat(date_value)
+        except ValueError:
+            raise HTTPException(400, "date는 YYYY-MM-DD 형식이어야 합니다.") from None
+    items = _todo_items(db, user)
+    matching = [
+        item
+        for item in items
+        if (not status or item.get("status", "미완료") == status)
+        and (not date_value or item.get("dueDate") == date_value)
+    ]
+    try:
+        offset = int(cursor or 0)
+    except ValueError:
+        raise HTTPException(400, "cursor 값이 올바르지 않습니다.") from None
+    if offset < 0 or offset > len(matching):
+        raise HTTPException(400, "cursor 값이 현재 할 일 목록 범위를 벗어났습니다.")
+    page = matching[offset : offset + limit]
+    return envelope(
+        {
+            "items": page,
+            "nextCursor": str(offset + limit)
+            if offset + limit < len(matching)
+            else None,
+        }
+    )
+
+
+@router.get("/workspace/todos", summary="내 할 일 목록 호환 조회")
+def get_workspace_todos(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    return envelope({"list": _todo_items(db, user)[:100]})
+
+
+@router.post("/todos", status_code=201, summary="할 일 추가")
+@router.post(
+    "/me/todos", status_code=201, summary="할 일 추가", include_in_schema=False
+)
+def create_todo(
+    payload: TodoCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    data = payload.model_dump()
+    if data["dueDate"]:
+        try:
+            date.fromisoformat(data["dueDate"])
+        except ValueError:
+            raise HTTPException(
+                422, "dueDate는 YYYY-MM-DD 형식이어야 합니다."
+            ) from None
+    data.update(
+        status="예정"
+        if data["dueDate"] and data["dueDate"] > date.today().isoformat()
+        else "미완료",
+        completedAt=None,
+    )
+    record = create_record(db, "todo", data, user)
+    return envelope(_todo_item(record), "할 일을 추가했습니다.", 201)
+
+
+@router.patch("/todos/{todo_id}", summary="할 일 수정 또는 완료 처리")
+@router.patch(
+    "/me/todos/{todo_id}", summary="할 일 수정 또는 완료 처리", include_in_schema=False
+)
+def patch_todo(
+    todo_id: str,
+    payload: TodoPatch,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    todo = get_record(db, "todo", todo_id)
+    if todo.owner_id != user.id:
+        raise HTTPException(404, "할 일을 찾을 수 없습니다.")
+    data = {**todo.payload, **payload.model_dump(exclude_unset=True)}
+    if data.get("dueDate"):
+        try:
+            date.fromisoformat(data["dueDate"])
+        except ValueError:
+            raise HTTPException(
+                422, "dueDate는 YYYY-MM-DD 형식이어야 합니다."
+            ) from None
+    if data.get("status") == "완료":
+        data["completedAt"] = data.get("completedAt") or iso(datetime.now(timezone.utc))
+    elif "status" in payload.model_fields_set:
+        data["completedAt"] = None
+    update_record(db, todo, data)
+    return envelope(_todo_item(todo), "할 일을 수정했습니다.")
+
+
+@router.delete("/todos/{todo_id}", summary="할 일 삭제")
+@router.delete("/me/todos/{todo_id}", summary="할 일 삭제", include_in_schema=False)
+def delete_todo(
+    todo_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    todo = get_record(db, "todo", todo_id)
+    if todo.owner_id != user.id:
+        raise HTTPException(404, "할 일을 찾을 수 없습니다.")
+    db.delete(todo)
+    db.commit()
+    return envelope({"id": todo_id, "deleted": True}, "할 일을 삭제했습니다.")
+
+
 @router.get("/projects", summary="프로젝트 목록")
 def get_projects(
+    q: str | None = None,
+    status: str | None = None,
+    dept: str | None = None,
+    recruiting_only: bool = Query(False, alias="recruitingOnly"),
+    role: str | None = None,
+    interest_only: bool = Query(False, alias="interestOnly"),
+    sort: str = "recent",
     cursor: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    records, next_cursor = list_records(db, "project", cursor, limit)
-    items = []
-    for project in records:
+    if sort not in {"recent", "name", "progress"}:
+        raise HTTPException(400, "sort는 recent, name, progress 중 하나여야 합니다.")
+    projects = list(
+        db.scalars(
+            select(Resource)
+            .where(Resource.resource_type == "project")
+            .order_by(Resource.id.desc())
+        )
+    )
+    profile = user_profile(db, user)
+    interests = {str(value).casefold() for value in profile.get("interests", [])}
+    if profile.get("major"):
+        interests.add(str(profile["major"]).casefold())
+    values = []
+    for project in projects:
         data = project.payload
-        items.append(
+        project_status = str(data.get("status", "진행 중"))
+        department = str(data.get("dept", data.get("department", "")))
+        openings = list(data.get("openings", []))
+        active_openings = []
+        for opening in openings:
+            if not isinstance(opening, dict):
+                continue
+            remaining_value = opening.get(
+                "remaining", opening.get("count", opening.get("headcount", 1))
+            )
+            try:
+                remaining = int(remaining_value or 0)
+            except (TypeError, ValueError):
+                digits = "".join(
+                    char for char in str(remaining_value) if char.isdigit()
+                )
+                remaining = int(digits or "1")
+            if (
+                not opening.get("closed", False)
+                and opening.get("status") not in {"모집 마감", "마감", "완료"}
+                and remaining > 0
+            ):
+                active_openings.append(opening)
+        if (
+            q
+            and q.casefold()
+            not in " ".join(
+                str(data.get(key, "")) for key in ("name", "description", "desc", "pm")
+            ).casefold()
+        ):
+            continue
+        if status and status not in {"전체", "all"} and project_status != status:
+            continue
+        if dept and dept not in {"전체", "all"} and department != dept:
+            continue
+        if recruiting_only and not active_openings:
+            continue
+        selected_openings = active_openings if recruiting_only else openings
+        if role and role not in {"전체", "all", "내 관심 직군"}:
+            selected_openings = [
+                opening
+                for opening in selected_openings
+                if role.casefold()
+                in str(opening.get("role", opening.get("position", ""))).casefold()
+            ]
+            if not selected_openings:
+                continue
+        if interest_only or role == "내 관심 직군":
+            selected_openings = [
+                opening
+                for opening in selected_openings
+                if str(opening.get("role", opening.get("position", ""))).casefold()
+                in interests
+            ]
+            if not selected_openings:
+                continue
+        values.append(
             {
                 "id": data.get("slug", str(project.id)),
                 "name": data.get("name", ""),
                 "desc": data.get("description", data.get("desc", "")),
                 "role": data.get("role", ""),
                 "progress": data.get("progress", 0),
-                "status": data.get("status", "진행 중"),
+                "status": project_status,
                 "tone": data.get("tone", ""),
                 "due": data.get("due", ""),
                 "milestone": data.get("milestone", ""),
+                "nextMilestone": data.get("nextMilestone", data.get("milestone", "")),
                 "pm": data.get("pm", ""),
+                "dept": department,
                 "members": data.get("members", []),
-                "openings": data.get("openings", []),
+                "openings": selected_openings,
+                "updatedAt": data.get("updatedAt") or iso(project.updated_at),
+                "_recordId": project.id,
             }
         )
-    return envelope({"items": items, "nextCursor": next_cursor})
+    if sort == "name":
+        values.sort(key=lambda item: (item["name"].casefold(), item["_recordId"]))
+    elif sort == "progress":
+        values.sort(
+            key=lambda item: (int(item.get("progress", 0) or 0), item["_recordId"]),
+            reverse=True,
+        )
+    else:
+        values.sort(
+            key=lambda item: (item["updatedAt"] or "", item["_recordId"]), reverse=True
+        )
+    start = 0
+    if cursor:
+        positions = [
+            index for index, item in enumerate(values) if str(item["id"]) == cursor
+        ]
+        if not positions:
+            raise HTTPException(400, "cursor가 현재 프로젝트 목록에 없습니다.")
+        start = positions[0] + 1
+    page = values[start : start + limit]
+    next_cursor = str(page[-1]["id"]) if page and start + limit < len(values) else None
+    for item in page:
+        item.pop("_recordId", None)
+    return envelope({"items": page, "nextCursor": next_cursor, "total": len(values)})
 
 
 @router.get("/me/summary", summary="내 공간 요약")
@@ -60,15 +373,27 @@ def my_summary(db: Session = Depends(get_db), user: User = Depends(get_current_u
     )
     posts = list(
         db.scalars(
-            select(Resource).where(
-                Resource.resource_type == "post", Resource.owner_id == user.id
-            )
+            select(Resource).where(Resource.resource_type == "post", owner_filter(user))
         )
     )
     inquiries = list(
         db.scalars(
             select(Resource).where(
-                Resource.resource_type == "inquiry", Resource.owner_id == user.id
+                Resource.resource_type == "inquiry", owner_filter(user)
+            )
+        )
+    )
+    proposals = list(
+        db.scalars(
+            select(Resource).where(
+                Resource.resource_type == "proposal", owner_filter(user)
+            )
+        )
+    )
+    todos = list(
+        db.scalars(
+            select(Resource).where(
+                Resource.resource_type == "todo", Resource.owner_id == user.id
             )
         )
     )
@@ -88,8 +413,19 @@ def my_summary(db: Session = Depends(get_db), user: User = Depends(get_current_u
             ),
             "submittedApprovals": len(mine),
             "myPosts": len(posts),
+            "myProposals": len(proposals),
             "myInquiries": len(inquiries),
             "receivedApprovals": len(received),
+            "todos": {
+                "total": len(todos) + len(received),
+                "today": sum(
+                    r.payload.get("dueDate") == date.today().isoformat()
+                    and r.payload.get("status", "미완료") != "완료"
+                    for r in todos
+                ),
+                "completed": sum(r.payload.get("status") == "완료" for r in todos),
+                "linkedApprovals": len(received),
+            },
         }
     )
 
@@ -104,12 +440,21 @@ def my_activity(
     candidates = list(
         db.scalars(
             select(Resource)
-            .where(Resource.owner_id == user.id)
+            .where(owner_filter(user))
             .order_by(Resource.id.desc())
-            .limit(300)
+            .limit(1000)
         )
     )
-    allowed = {"approval", "post", "comment", "inquiry", "application", "event_rsvp"}
+    allowed = {
+        "approval",
+        "post",
+        "comment",
+        "inquiry",
+        "proposal",
+        "todo",
+        "application",
+        "event_rsvp",
+    }
     candidates = [r for r in candidates if r.resource_type in allowed]
     if cursor:
         try:
@@ -296,29 +641,203 @@ class Rsvp(BaseModel):
 @router.get("/events", summary="월별 일정")
 def get_events(
     month: str,
+    scope: str | None = None,
+    q: str | None = None,
     cursor: str | None = None,
     limit: int = Query(100, ge=1, le=200),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if len(month) != 7 or month[4] != "-":
+    try:
+        datetime.strptime(month, "%Y-%m")
+    except ValueError:
         raise HTTPException(400, "month는 YYYY-MM 형식이어야 합니다.")
-    records, next_cursor = list_records(db, "event", cursor, limit)
+    if scope and scope not in {
+        "전체",
+        "팀",
+        "프로젝트",
+        "개인",
+        "all",
+        "team",
+        "project",
+        "personal",
+    }:
+        raise HTTPException(400, "지원하지 않는 일정 범위입니다.")
+    records = list(
+        db.scalars(
+            select(Resource)
+            .where(Resource.resource_type == "event")
+            .order_by(Resource.id.desc())
+        )
+    )
     events = []
     for record in records:
         data = record.payload
         if not str(data.get("date", "")).startswith(month):
+            continue
+        event_scope = data.get("scope", data.get("kind", "팀"))
+        if (
+            scope
+            and scope not in {"전체", "all"}
+            and event_scope
+            not in {
+                scope,
+                {"team": "팀", "project": "프로젝트", "personal": "개인"}.get(scope),
+            }
+        ):
+            continue
+        if (
+            q
+            and q.casefold()
+            not in " ".join(
+                str(data.get(key, "")) for key in ("title", "place", "host", "agenda")
+            ).casefold()
+        ):
             continue
         event = {
             "id": str(record.id),
             **{k: v for k, v in data.items() if k != "rsvpByUser"},
         }
         event["rsvp"] = bool(data.get("rsvpEnabled", data.get("rsvp", False)))
-        event["myRsvp"] = data.get("rsvpByUser", {}).get(str(user.id))
+        responses = data.get("rsvpByUser", {})
+        my_rsvp = responses.get(str(user.id))
+        event["myRsvp"] = my_rsvp.get("rsvp") if isinstance(my_rsvp, dict) else my_rsvp
+        event["rsvpCount"] = sum(
+            isinstance(response, dict) and response.get("rsvp") == "참석"
+            for response in responses.values()
+        )
         events.append(event)
-    return envelope(
-        {"items": events, "nextCursor": next_cursor if len(events) == limit else None}
+    events.sort(
+        key=lambda event: (
+            event.get("date", ""),
+            event.get("time", ""),
+            int(event["id"]),
+        )
     )
+    start = 0
+    if cursor:
+        positions = [
+            index for index, event in enumerate(events) if event["id"] == cursor
+        ]
+        if not positions:
+            raise HTTPException(400, "cursor가 현재 일정 목록에 없습니다.")
+        start = positions[0] + 1
+    page = events[start : start + limit]
+    return envelope(
+        {
+            "items": page,
+            "nextCursor": page[-1]["id"]
+            if page and start + limit < len(events)
+            else None,
+        }
+    )
+
+
+@router.get("/dashboard/home", summary="홈 대시보드")
+def dashboard_home(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    today = date.today().isoformat()
+    todos = _todo_items(db, user)
+    open_todos = [item for item in todos if item.get("status", "미완료") != "완료"]
+    today_todos = [todo for todo in open_todos if todo.get("dueDate") == today]
+    notifications = list(
+        db.scalars(
+            select(Resource)
+            .where(
+                Resource.resource_type == "notification",
+                Resource.owner_id == user.id,
+            )
+            .order_by(Resource.id.desc())
+            .limit(5)
+        )
+    )
+    unread_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(Resource)
+            .where(
+                Resource.resource_type == "notification",
+                Resource.owner_id == user.id,
+                Resource.payload["unread"].as_boolean().is_(True),
+            )
+        )
+        or 0
+    )
+    approvals = list(
+        db.scalars(select(Resource).where(Resource.resource_type == "approval"))
+    )
+    pending_approvals = [
+        {"id": str(approval.id), **approval.payload}
+        for approval in approvals
+        if any(
+            str(line.get("userId")) == str(user.id) and line.get("state") == "now"
+            for line in approval.payload.get("line", [])
+        )
+    ]
+    next_events = [
+        record
+        for record in db.scalars(
+            select(Resource).where(Resource.resource_type == "event")
+        )
+        if str(record.payload.get("date", "")) >= today
+    ]
+    next_events.sort(
+        key=lambda record: (
+            record.payload.get("date", ""),
+            record.payload.get("time", ""),
+        )
+    )
+    event_preview = (
+        {"id": str(next_events[0].id), **next_events[0].payload}
+        if next_events
+        else None
+    )
+    latest_notice = db.scalar(
+        select(Resource)
+        .where(Resource.resource_type == "notice")
+        .order_by(Resource.id.desc())
+        .limit(1)
+    )
+    notice_preview = (
+        {"id": str(latest_notice.id), **latest_notice.payload}
+        if latest_notice
+        else None
+    )
+    data = {
+        "me": user_profile(db, user),
+        "summary": {
+            "todoCount": len(open_todos),
+            "todayTodoCount": len(today_todos),
+            "unreadNotifications": int(unread_count or 0),
+            "receivedApprovalCount": len(pending_approvals),
+            "notice": notice_preview,
+            "schedule": event_preview,
+        },
+        "todos": open_todos[:5],
+        "notifications": [
+            {"id": str(record.id), **record.payload} for record in notifications
+        ],
+        "approvals": pending_approvals[:5],
+        "events": [
+            {"id": str(record.id), **record.payload} for record in next_events[:5]
+        ],
+        "projects": my_projects(db, user)["items"][:5],
+    }
+    if user_can_finance(user):
+        finance_settings = db.scalar(
+            select(Resource).where(Resource.resource_type == "finance_settings")
+        )
+        pools = (finance_settings.payload if finance_settings else {}).get("pools", [])
+        data["finance"] = {
+            "available": sum(
+                int(pool.get("amount", 0) or 0)
+                for pool in pools
+                if pool.get("id") == "operation"
+            ),
+            "pools": pools,
+        }
+    return envelope(data)
 
 
 @router.post("/events/{event_id}/rsvp", summary="일정 참석 응답")

@@ -1,10 +1,12 @@
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.resource import Resource
 from app.models.user import User
 
@@ -174,6 +176,36 @@ def notify_user(
         "action": action,
     }
     create_record(db, "notification", notification, db.get(User, user_id))
-    from app.services.push import send_push
+    if not _is_do_not_disturb(preferences.payload if preferences else {}):
+        from app.services.push import send_push
 
-    send_push(db, user_id, notification)
+        send_push(db, user_id, notification)
+
+
+def _is_do_not_disturb(preferences: dict[str, Any]) -> bool:
+    if not preferences.get("dnd"):
+        return False
+    try:
+        local_now = datetime.now(ZoneInfo(settings.app_timezone))
+        start = time.fromisoformat(str(preferences.get("dndFrom", "23:00")))
+        end = time.fromisoformat(str(preferences.get("dndTo", "08:00")))
+    except (ValueError, KeyError):
+        return False
+    days = set(preferences.get("dndDays") or [])
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    selected_today = (
+        not days
+        or weekday_names[local_now.weekday()] in days
+        or str(local_now.weekday()) in days
+    )
+    current = local_now.time().replace(tzinfo=None)
+    if start == end:
+        return selected_today
+    if start < end:
+        return selected_today and start <= current < end
+    if current >= start:
+        return selected_today
+    previous_day = weekday_names[(local_now.weekday() - 1) % 7]
+    previous_index = str((local_now.weekday() - 1) % 7)
+    selected_previous = not days or previous_day in days or previous_index in days
+    return selected_previous and current < end

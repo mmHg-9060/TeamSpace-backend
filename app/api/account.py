@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -42,6 +42,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     name: str = Field(min_length=1, max_length=100)
     dept: str
+    password: str | None = Field(default=None, min_length=8, max_length=128)
     major: str | None = None
     cohort: str | None = None
     message: str | None = None
@@ -59,6 +60,15 @@ class ResetPassword(BaseModel):
 class ReadNotifications(BaseModel):
     id: str | None = None
     all: bool = False
+
+
+class NotificationSettingsPatch(BaseModel):
+    push: bool | None = None
+    kinds: dict[str, bool] | None = None
+    dnd: bool | None = None
+    dndFrom: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    dndTo: str | None = Field(default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    dndDays: list[str] | None = None
 
 
 @router.get("/me", summary="내 정보")
@@ -152,16 +162,24 @@ def signup_request(payload: SignupRequest, db: Session = Depends(get_db)):
     existing = db.scalar(select(User.id).where(User.email == str(payload.email)))
     if existing:
         raise HTTPException(409, "이미 등록된 이메일입니다.")
-    record = create_record(
-        db,
-        "signup_request",
-        {
-            **payload.model_dump(),
-            "email": str(payload.email),
-            "status": "PENDING",
-            "createdAt": iso(datetime.now(timezone.utc)),
-        },
+    pending = db.scalar(
+        select(Resource).where(
+            Resource.resource_type == "signup_request",
+            Resource.payload["email"].as_string() == str(payload.email),
+            Resource.payload["status"].as_string() == "PENDING",
+        )
     )
+    if pending:
+        raise HTTPException(409, "이미 검토 중인 가입 요청이 있습니다.")
+    data = payload.model_dump(exclude={"password"})
+    data["email"] = str(payload.email)
+    if payload.password:
+        data["passwordHash"] = hash_password(payload.password)
+    data.update(
+        status="PENDING",
+        createdAt=iso(datetime.now(timezone.utc)),
+    )
+    record = create_record(db, "signup_request", data)
     return envelope(
         {"id": str(record.id), "status": "PENDING"}, "가입 요청을 접수했습니다.", 202
     )
@@ -239,6 +257,8 @@ def password_reset(payload: ResetPassword, db: Session = Depends(get_db)):
 
 @router.get("/notifications", summary="알림 목록")
 def get_notifications(
+    kind: str | None = None,
+    unread: bool | None = None,
     cursor: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -249,6 +269,15 @@ def get_notifications(
         .where(Resource.resource_type == "notification", Resource.owner_id == user.id)
         .order_by(Resource.id.desc())
     )
+    if kind and kind not in {"전체", "all"}:
+        stmt = stmt.where(
+            or_(
+                Resource.payload["kind"].as_string() == kind,
+                Resource.payload["sourceKind"].as_string() == kind,
+            )
+        )
+    if unread is not None:
+        stmt = stmt.where(Resource.payload["unread"].as_boolean().is_(unread))
     if cursor:
         try:
             stmt = stmt.where(Resource.id < int(cursor))
@@ -316,7 +345,7 @@ def get_notification_settings(
 
 @router.patch("/me/notification-settings", summary="알림 설정 수정")
 def patch_notification_settings(
-    payload: dict[str, Any],
+    payload: NotificationSettingsPatch,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -327,7 +356,17 @@ def patch_notification_settings(
         )
     )
     current = record.payload if record else {}
-    data = {**current, **payload}
+    values = payload.model_dump(exclude_unset=True)
+    if "kinds" in values and values["kinds"] is not None:
+        allowed_kinds = {"내 업무", "재정", "일정", "공지", "게시판"}
+        if not set(values["kinds"]).issubset(allowed_kinds):
+            raise HTTPException(422, "지원하지 않는 알림 분류가 포함되어 있습니다.")
+        values["kinds"] = {**current.get("kinds", {}), **values["kinds"]}
+    if "dndDays" in values and values["dndDays"] is not None:
+        allowed_days = {"월", "화", "수", "목", "금", "토", "일"}
+        if not set(values["dndDays"]).issubset(allowed_days):
+            raise HTTPException(422, "방해 금지 요일이 올바르지 않습니다.")
+    data = {**current, **values}
     if record:
         update_record(db, record, data)
     else:

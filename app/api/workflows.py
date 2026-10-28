@@ -3,7 +3,7 @@ from datetime import date, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ from app.db.session import get_db
 from app.models.bank import BankSyncRun
 from app.models.resource import Resource
 from app.models.user import User
+from app.services.anonymity import is_record_owner
 
 router = APIRouter()
 
@@ -41,7 +42,9 @@ def _approval_item(record: Resource, db: Session, viewer: User) -> dict[str, Any
     result.setdefault("files", [])
     result.setdefault("line", [])
     result["received"] = any(
-        int(step.get("userId", 0) or 0) == viewer.id for step in result["line"]
+        int(step.get("userId", 0) or 0) == viewer.id
+        and step.get("state") in {"now", "wait"}
+        for step in result["line"]
     )
     # Keep internal workflow identifiers out of the public response.
     result.pop("approverIds", None)
@@ -62,7 +65,7 @@ def _approvers(
     if not leads:
         leads = [u for u in eligible if "Admin" in (u.roles or [])]
     line = leads[:1]
-    if kind == "비용 승인" and amount >= 300000:
+    if kind in {"비용 승인", "프로젝트 요청", "운영 요청"} and amount >= 300000:
         fa = [u for u in eligible if set(u.roles or []).intersection({"FA", "Admin"})]
         if fa and (not line or fa[0].id != line[0].id):
             line.extend(fa[:1])
@@ -73,6 +76,34 @@ def _notify_approval(
     db: Session, record: Resource, user_id: int | None, title: str, action: bool = True
 ):
     notify_user(db, user_id, "내 업무", title, f"/inhouse/requests/{record.id}", action)
+
+
+def _approval_files(db: Session, files: list[Any], user: User) -> list[dict[str, Any]]:
+    normalized = []
+    for value in files:
+        if isinstance(value, dict):
+            file_id = value.get("id", value.get("uploadId", value.get("fileId")))
+            if not file_id and value.get("url"):
+                file_id = str(value["url"]).split("/uploads/")[-1].split("?")[0]
+        else:
+            file_id = str(value).split("/uploads/")[-1].split("?")[0]
+        if not file_id or not str(file_id).isdigit():
+            raise HTTPException(422, "결재 첨부 파일 ID가 올바르지 않습니다.")
+        upload = get_record(db, "upload", str(file_id))
+        if not is_record_owner(upload, user):
+            raise HTTPException(
+                403, "본인이 업로드한 파일만 결재에 첨부할 수 있습니다."
+            )
+        normalized.append(
+            {
+                "id": str(upload.id),
+                "url": f"/uploads/{upload.id}",
+                "filename": upload.payload.get("filename", "file"),
+                "size": int(upload.payload.get("size", 0)),
+                "contentType": upload.payload.get("contentType", ""),
+            }
+        )
+    return normalized
 
 
 @router.get("/approvals", summary="결재 목록")
@@ -91,7 +122,11 @@ def get_approvals(
     for record in records:
         data = record.payload
         line = data.get("line", [])
-        is_received = any(int(step.get("userId", 0) or 0) == user.id for step in line)
+        is_received = any(
+            int(step.get("userId", 0) or 0) == user.id
+            and step.get("state") in {"now", "wait"}
+            for step in line
+        )
         if box == "mine" and record.owner_id != user.id:
             continue
         if box == "received" and not is_received:
@@ -132,15 +167,22 @@ def get_approval(
 class ApprovalCreate(BaseModel):
     kind: str
     type: str = ""
-    title: str = Field(min_length=1, max_length=200)
+    title: str = Field(default="", max_length=200)
     amount: int | str = 0
     status: str = "결재 대기"
     project: str = ""
     useDate: str = ""
     reason: str = ""
-    files: list[Any] = []
-    staff: dict[str, int] = {}
+    files: list[Any] = Field(default_factory=list)
+    staff: dict[str, int] = Field(default_factory=dict)
     period: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+    schedule: dict[str, Any] = Field(default_factory=dict)
+    budget: dict[str, Any] = Field(default_factory=dict)
+    personnel: list[dict[str, Any]] = Field(default_factory=list)
+    costType: str = ""
+
+    model_config = ConfigDict(extra="allow")
 
 
 @router.post("/approvals", status_code=201, summary="결재 작성 또는 임시 저장")
@@ -149,14 +191,50 @@ def create_approval(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    kind = (
-        "인력 지원"
-        if payload.kind in {"project", "staff", "인력 지원"}
-        else "비용 승인"
-    )
-    draft = payload.status == "작성 중"
+    kind_aliases = {
+        "cost": "비용 승인",
+        "expense": "비용 승인",
+        "비용": "비용 승인",
+        "비용 승인 요청": "비용 승인",
+        "비용 승인": "비용 승인",
+        "project": "인력 지원",
+        "staff": "인력 지원",
+        "project_staffing": "인력 지원",
+        "프로젝트 인력 지원": "인력 지원",
+        "인력 지원": "인력 지원",
+        "project_request": "프로젝트 요청",
+        "project-request": "프로젝트 요청",
+        "프로젝트 요청": "프로젝트 요청",
+        "프로젝트 관련 요청서": "프로젝트 요청",
+        "operating": "운영 요청",
+        "operations": "운영 요청",
+        "운영 요청": "운영 요청",
+        "운영 관련 요청서": "운영 요청",
+        "internal": "기타 내부 문서",
+        "기타 내부 문서": "기타 내부 문서",
+    }
+    kind = kind_aliases.get(payload.kind)
+    if kind is None:
+        raise HTTPException(422, "지원하지 않는 결재 문서 유형입니다.")
+    draft = payload.status in {"작성 중", "draft", "DRAFT"}
+    if not draft and not payload.title.strip():
+        raise HTTPException(422, "결재 제목을 입력해주세요.")
+    if (
+        not draft
+        and kind == "인력 지원"
+        and not payload.staff
+        and not payload.personnel
+    ):
+        raise HTTPException(422, "지원할 직군과 인원을 입력해주세요.")
+    if (
+        not draft
+        and kind in {"프로젝트 요청", "운영 요청", "기타 내부 문서"}
+        and not payload.reason.strip()
+    ):
+        raise HTTPException(422, "요청 사유를 입력해주세요.")
+    amount_source = payload.amount or payload.budget.get("amount", 0)
     try:
-        amount = int(str(payload.amount).replace(",", "").replace("원", ""))
+        amount = int(str(amount_source).replace(",", "").replace("원", ""))
     except ValueError:
         amount = 0
     line = [
@@ -190,6 +268,11 @@ def create_approval(
         db,
         "approval",
         {
+            **{
+                key: value
+                for key, value in payload.model_dump().items()
+                if key not in {"line", "approverIds", "author", "authorId", "received"}
+            },
             "kind": kind,
             "type": payload.type
             or (
@@ -205,7 +288,7 @@ def create_approval(
             "useDate": payload.useDate,
             "reason": payload.reason,
             "line": line,
-            "files": payload.files,
+            "files": _approval_files(db, payload.files, user),
             "comments": [],
             "approverIds": [u.id for u in approvers],
             "staff": payload.staff,
@@ -234,6 +317,8 @@ def patch_approval(
     }:
         raise HTTPException(403, "작성 중이거나 반려된 본인 결재만 수정할 수 있습니다.")
     data = {**record.payload, **payload}
+    if "files" in payload:
+        data["files"] = _approval_files(db, list(payload.get("files") or []), user)
     if payload.get("status") == "결재 대기":
         amount_value = data.get("amountValue", data.get("amount", 0))
         try:
@@ -359,6 +444,15 @@ def cancel(
         raise HTTPException(403, "취소할 수 없는 결재입니다.")
     data = {**record.payload, "status": "취소"}
     update_record(db, record, data)
+    for step in record.payload.get("line", []):
+        if step.get("state") in {"now", "wait"}:
+            _notify_approval(
+                db,
+                record,
+                int(step.get("userId", 0) or 0),
+                f"결재가 취소됐어요: {record.payload.get('title', '')}",
+                False,
+            )
     return envelope({"id": str(record.id), "status": "취소"}, "결재를 취소했습니다.")
 
 

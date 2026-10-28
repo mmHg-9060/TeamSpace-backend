@@ -33,6 +33,10 @@ python -m ruff format app main.py
 
 ## API 범위
 
+- 디자인 보강: /todos와 /me/todos의 할 일 CRUD, 결재 검토 할 일, 프로젝트 목록 검색·부서·상태·모집 필터, 월별 일정 범위·검색 필터, /dashboard/home의 실제 사용자 데이터
+- 커뮤니티 보강: 게시글 임시 저장·수정·이미지 5장 첨부, 디자인 카테고리, 운영 제안 목록·상세·댓글·추천·관리자 상태 변경, 권한 안전 통합 검색
+- 결재 보강: 비용·인력 지원·프로젝트 요청·운영 요청·기타 내부 문서 유형과 업로드 소유권 검증
+
 - 인증·프로필·팀원: `/auth/login`, `/auth/signup-requests`, `/auth/password-reset-*`, `/me`, `/people`
 - 알림·설정·푸시: `/notifications`, `/me/notification-settings`, `/push/subscriptions`
 - 재무: `/finance/summary`, `/finance/receipts`, `/finance/contracts/{project}`, 은행 계좌·동기화·가져온 거래·반영 이력(`/finance/bank-accounts`, `/finance/bank-syncs`, `/finance/bank-imports`, `/finance/bank-import-commits`) 및 `/admin/finance/*`
@@ -47,6 +51,7 @@ python -m ruff format app main.py
 
 ## 외부 서비스 설정
 
+익명 글·댓글·문의는 DB resources.owner_id에 작성자의 사용자 ID를 저장하지 않고 author를 "익명"으로 기록합니다. 본인 활동 관리에는 비밀키 기반 익명 소유 키를 사용하며 API 응답에서 이 키를 제외합니다. 기존 익명 레코드와 해당 글의 첨부 파일도 서버 시작 시 직접 사용자 연결을 제거합니다. ANONYMOUS_AUTHOR_SECRET을 별도로 설정하면 JWT_SECRET_KEY 변경 후에도 익명 활동 소유권이 유지됩니다. 생략하면 JWT_SECRET_KEY에서 익명 소유 키를 계산하므로 JWT 키를 회전하기 전에 별도 익명 키를 설정해야 합니다.
 - SMTP 메일 발송 코드는 `app/services/email.py`에 있으며, 설정은 프로젝트 루트 `.env`에서 읽습니다. `.env.example`의 `SMTP_*` 항목을 메일 제공자의 SMTP 값으로 채우면 비밀번호 재설정 메일이 발송됩니다.
 - 일반적으로 포트 587은 `SMTP_USE_TLS=true`, `SMTP_USE_SSL=false`; 포트 465는 `SMTP_USE_TLS=false`, `SMTP_USE_SSL=true`로 설정합니다. 두 옵션을 동시에 켜지 마세요. 인증이 필요한 제공자는 계정 주소를 `SMTP_USERNAME`, 앱 비밀번호를 `SMTP_PASSWORD`에 입력합니다.
 - 브라우저 푸시는 VAPID 키와 클라이언트 구독이 필요합니다. 설정하지 않아도 일반 알림 레코드는 저장되지만 실제 푸시는 전송하지 않습니다.
